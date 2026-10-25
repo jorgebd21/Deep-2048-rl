@@ -27,10 +27,10 @@ share/python-wheels/
 MANIFEST
 
 # Virtual environments
-.venv/
-venv/
-ENV/
-env/
+/.venv/
+/venv/
+/ENV/
+/env/
 
 # PyTorch checkpoints and models
 *.pt
