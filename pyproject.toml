@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deep-2048-rl"
+version = "0.1.0"
+description = "Autonomous Deep Reinforcement Learning agent for 2048 with Ampere GPU acceleration"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "Lead DRL Engineer" }
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "gymnasium>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+gpu = [
+    "torch",
+    "tensorboard>=2.15.0",
+    "onnx>=1.15.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
