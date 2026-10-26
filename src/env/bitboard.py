@@ -74,6 +74,35 @@ def _build_luts() -> Tuple[
 ) = _build_luts()
 
 
+def _build_snake_weights(base: float = 3.0) -> np.ndarray:
+    """Precompute the 8 Dihedral D4 snake monotonicity weight vectors of shape (8, 16)."""
+    p1 = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
+    idx_grid = np.arange(16).reshape(4, 4)
+    d4_grids = [
+        idx_grid,
+        np.rot90(idx_grid, 1),
+        np.rot90(idx_grid, 2),
+        np.rot90(idx_grid, 3),
+        np.fliplr(idx_grid),
+        np.rot90(np.fliplr(idx_grid), 1),
+        np.rot90(np.fliplr(idx_grid), 2),
+        np.rot90(np.fliplr(idx_grid), 3),
+    ]
+
+    snake_weights = np.zeros((8, 16), dtype=np.float32)
+    norm_factor = float(base ** 15)
+    for k, grid in enumerate(d4_grids):
+        for i in range(16):
+            cell = p1[i]
+            r, c = cell // 4, cell % 4
+            mapped = int(grid[r, c])
+            snake_weights[k, mapped] = float(base ** (15 - i)) / norm_factor
+    return snake_weights
+
+
+SNAKE_WEIGHTS_8x16 = _build_snake_weights(base=3.0)
+
+
 class Bitboard2048:
     """High-performance 64-bit Bitboard 2048 game engine."""
 
@@ -256,6 +285,59 @@ class Bitboard2048:
             if cls.is_move_legal(bb, act):
                 return False
         return True
+
+    @classmethod
+    def compute_snake_score(cls, bb: int) -> float:
+        """Compute maximum Dihedral D4 snake monotonicity score."""
+        ranks = np.array([(bb >> (4 * i)) & 0xF for i in range(16)], dtype=np.float32)
+        scores = np.dot(SNAKE_WEIGHTS_8x16, ranks)
+        return float(np.max(scores))
+
+    @classmethod
+    def compute_corner_penalty(cls, bb: int) -> float:
+        """Compute penalty for dislodged maximum tile.
+
+        Returns:
+            0.0 if maximum tile is located in any of the 4 outer corners,
+            k_max * 2.0 if dislodged to the interior cells,
+            k_max * 1.0 if dislodged to outer non-corner edges.
+            (Only active for max tiles >= 128, i.e., rank >= 7).
+        """
+        ranks = [(bb >> (4 * i)) & 0xF for i in range(16)]
+        k_max = max(ranks)
+        if k_max < 7:
+            return 0.0
+
+        # 4 outer corners: (0,0)->0, (0,3)->3, (3,0)->12, (3,3)->15
+        if ranks[0] == k_max or ranks[3] == k_max or ranks[12] == k_max or ranks[15] == k_max:
+            return 0.0
+
+        # 4 interior cells: (1,1)->5, (1,2)->6, (2,1)->9, (2,2)->10
+        if ranks[5] == k_max or ranks[6] == k_max or ranks[9] == k_max or ranks[10] == k_max:
+            return float(k_max * 2.0)
+
+        # Dislodged to an outer edge
+        return float(k_max * 1.0)
+
+    @classmethod
+    def get_adaptive_depth(cls, bb: int) -> int:
+        """Determine dynamic Expectimax lookahead depth based on board complexity.
+
+        Returns:
+            4 for Critical End Game (empty <= 4 and max tile >= 1024)
+            2 for Early/Open Game (empty >= 8 and max tile < 1024)
+            3 for Mid Game (otherwise)
+        """
+        empty_count = cls.count_empty_cells(bb)
+        max_rank = max((bb >> (4 * i)) & 0xF for i in range(16))
+        max_tile = (1 << max_rank) if max_rank > 0 else 0
+
+        if empty_count <= 4 and max_tile >= 1024:
+            return 4
+        elif empty_count >= 8 and max_tile < 1024:
+            return 2
+        else:
+            return 3
 
     @staticmethod
     def get_empty_cells(bb: int) -> List[int]:

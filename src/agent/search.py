@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.env.core import Action, Game2048Core
-from src.env.bitboard import Bitboard2048
+from src.env.bitboard import Bitboard2048, SNAKE_WEIGHTS_8x16
 from src.env.wrapper import _POWER_LUT, MAX_TILE_VAL, one_hot_encode_board
 from src.utils.cuda_utils import get_device
 
@@ -35,6 +35,10 @@ _D4_ACTION_PERMUTATIONS = [
 ]
 
 _SHIFTS_64 = np.arange(0, 64, 4, dtype=np.uint64).reshape(1, 16)
+
+# Cells ordered by constraint/perimeter priority: corners first, outer edges, then interior
+_CELL_PRIORITY = (0, 3, 12, 15, 1, 2, 4, 7, 8, 11, 13, 14, 5, 6, 9, 10)
+_PRIORITY_ORDER = {cell: idx for idx, cell in enumerate(_CELL_PRIORITY)}
 
 
 def generate_d4_tensors(x: torch.Tensor) -> torch.Tensor:
@@ -81,6 +85,8 @@ class ExpectimaxSearcher:
         - Depth 2: 2-ply Expectimax (action slide -> chance spawns 2/4 -> evaluate leaf states).
         - Depth 3: 3-ply Expectimax (action 1 -> chance 1 -> action 2 -> evaluate leaf states).
         - Depth 4: 4-ply Expectimax (action 1 -> chance 1 -> action 2 -> chance 2 -> evaluate leaf states).
+        - Adaptive Dynamic Depth: Automatically selects 2-ply, 3-ply, or 4-ply based on board complexity.
+        - Topological Snake Monotonicity & Corner-Lock Evaluation Shield.
         - Transposition Table (TT) with 64-bit canonical Dihedral D4 hashing.
         - Dihedral D4 Symmetry: 8-fold isometric ensembling for rotation/reflection invariance.
     """
@@ -94,6 +100,10 @@ class ExpectimaxSearcher:
         max_empty_samples: Optional[int] = None,
         use_d4_symmetry: bool = False,
         tt_max_size: int = 500_000,
+        adaptive_depth: bool = False,
+        use_snake_heuristic: bool = True,
+        alpha_snake: float = 0.5,
+        beta_corner: float = 1.0,
     ) -> None:
         """Initialize searcher with model and search configuration.
 
@@ -106,6 +116,10 @@ class ExpectimaxSearcher:
                 None evaluates all empty cells deterministically.
             use_d4_symmetry: Whether to enable 8-fold Dihedral D4 symmetry ensembling.
             tt_max_size: Maximum entries in the Transposition Table before pruning.
+            adaptive_depth: Whether to dynamically select lookahead depth based on board state.
+            use_snake_heuristic: Whether to blend topological snake monotonicity and corner lock shield.
+            alpha_snake: Weight for snake monotonicity score (default 0.5).
+            beta_corner: Weight for corner dislodgement penalty (default 1.0).
         """
         self.model = model
         self.device = device or get_device(prefer_gpu=True)
@@ -114,6 +128,10 @@ class ExpectimaxSearcher:
         self.max_empty_samples = max_empty_samples
         self.use_d4_symmetry = use_d4_symmetry
         self.tt_max_size = tt_max_size
+        self.adaptive_depth = adaptive_depth
+        self.use_snake_heuristic = use_snake_heuristic
+        self.alpha_snake = alpha_snake
+        self.beta_corner = beta_corner
         self.tt: Dict[int, float] = {}
         self.core = Game2048Core()
 
@@ -127,6 +145,8 @@ class ExpectimaxSearcher:
         action_mask: Optional[np.ndarray] = None,
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
+        adaptive_depth: Optional[bool] = None,
+        use_snake_heuristic: Optional[bool] = None,
     ) -> int:
         """Select best action using lookahead search.
 
@@ -135,6 +155,8 @@ class ExpectimaxSearcher:
             action_mask: Optional boolean array of legal actions.
             depth: Optional search depth overriding instance default.
             use_d4_symmetry: Optional D4 symmetry toggle overriding instance default.
+            adaptive_depth: Optional adaptive depth toggle overriding instance default.
+            use_snake_heuristic: Optional snake heuristic toggle overriding instance default.
 
         Returns:
             Selected integer action in {0, 1, 2, 3}.
@@ -144,6 +166,8 @@ class ExpectimaxSearcher:
             action_mask=action_mask,
             depth=depth,
             use_d4_symmetry=use_d4_symmetry,
+            adaptive_depth=adaptive_depth,
+            use_snake_heuristic=use_snake_heuristic,
         )
         return best_action
 
@@ -153,25 +177,22 @@ class ExpectimaxSearcher:
         action_mask: Optional[np.ndarray] = None,
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
+        adaptive_depth: Optional[bool] = None,
+        use_snake_heuristic: Optional[bool] = None,
     ) -> Tuple[int, Dict[int, float]]:
         """Perform Expectimax search from current board state.
 
         Args:
             board: 4x4 integer numpy array or 64-bit bitboard integer.
             action_mask: Optional boolean array of shape (4,). If None, calculated via bitboard/core.
-            depth: Search depth (0, 1, 2, 3, or 4). Defaults to self.depth.
+            depth: Search depth (0, 1, 2, 3, or 4). Defaults to self.depth if adaptive_depth is False.
             use_d4_symmetry: Optional D4 toggle overriding instance setting.
+            adaptive_depth: Optional adaptive depth toggle overriding instance setting.
+            use_snake_heuristic: Optional snake heuristic toggle overriding instance setting.
 
         Returns:
             Tuple of (best_action, q_values_dict).
         """
-        d = self.depth if depth is None else depth
-        d4_active = self.use_d4_symmetry if use_d4_symmetry is None else use_d4_symmetry
-
-        # Prune cache between moves if maximum capacity is exceeded
-        if len(self.tt) > self.tt_max_size:
-            self.tt.clear()
-
         # Convert to bitboard if numpy array
         if isinstance(board, np.ndarray):
             bb = Bitboard2048.from_array(board)
@@ -179,6 +200,19 @@ class ExpectimaxSearcher:
         else:
             bb = int(board)
             np_board = None
+
+        is_adaptive = self.adaptive_depth if adaptive_depth is None else adaptive_depth
+        if is_adaptive:
+            d = Bitboard2048.get_adaptive_depth(bb)
+        else:
+            d = self.depth if depth is None else depth
+
+        d4_active = self.use_d4_symmetry if use_d4_symmetry is None else use_d4_symmetry
+        snake_active = self.use_snake_heuristic if use_snake_heuristic is None else use_snake_heuristic
+
+        # Prune cache between moves if maximum capacity is exceeded
+        if len(self.tt) > self.tt_max_size:
+            self.tt.clear()
 
         if action_mask is None:
             mask = Bitboard2048.get_action_mask(bb)
@@ -199,17 +233,22 @@ class ExpectimaxSearcher:
                 np_board = Bitboard2048.to_array(bb)
             return self._search_greedy(np_board, mask, use_d4=d4_active)
         elif d == 1:
-            return self._search_depth_1(bb, legal_actions, use_d4=d4_active)
+            return self._search_depth_1(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         elif d == 2:
-            return self._search_depth_2(bb, legal_actions, use_d4=d4_active)
+            return self._search_depth_2(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         elif d == 3:
-            return self._search_depth_3(bb, legal_actions, use_d4=d4_active)
+            return self._search_depth_3(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         elif d >= 4:
-            return self._search_depth_4(bb, legal_actions, use_d4=d4_active)
+            return self._search_depth_4(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         else:
-            return self._search_depth_2(bb, legal_actions, use_d4=d4_active)
+            return self._search_depth_2(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
 
-    def _ensure_evaluated(self, bitboards: Iterable[int], use_d4: bool) -> None:
+    def _ensure_evaluated(
+        self,
+        bitboards: Iterable[int],
+        use_d4: bool = False,
+        use_snake: bool = True,
+    ) -> None:
         """Evaluate un-cached canonical bitboards in a single batched GPU forward pass."""
         unrated: Dict[int, int] = {}
         for b in bitboards:
@@ -222,7 +261,7 @@ class ExpectimaxSearcher:
 
         canon_keys = list(unrated.keys())
         rep_boards = list(unrated.values())
-        v_vals = self._batch_evaluate_boards(rep_boards, use_d4=use_d4)
+        v_vals = self._batch_evaluate_boards(rep_boards, use_d4=use_d4, use_snake=use_snake)
 
         for k, v in zip(canon_keys, v_vals):
             self.tt[k] = float(v)
@@ -271,6 +310,7 @@ class ExpectimaxSearcher:
         bb: int,
         legal_actions: Sequence[int],
         use_d4: bool = False,
+        use_snake: bool = True,
     ) -> Tuple[int, Dict[int, float]]:
         """1-ply lookahead: evaluate afterstate for each legal action."""
         after_boards: List[int] = []
@@ -287,7 +327,7 @@ class ExpectimaxSearcher:
         if len(after_boards) == 0:
             return int(legal_actions[0]), {a: -1e9 for a in range(4)}
 
-        self._ensure_evaluated(after_boards, use_d4=use_d4)
+        self._ensure_evaluated(after_boards, use_d4=use_d4, use_snake=use_snake)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
         for a, lr, nb in zip(valid_actions, imm_rewards, after_boards):
@@ -302,6 +342,7 @@ class ExpectimaxSearcher:
         bb: int,
         legal_actions: Sequence[int],
         use_d4: bool = False,
+        use_snake: bool = True,
     ) -> Tuple[int, Dict[int, float]]:
         """2-ply Expectimax: action slide -> chance spawns 2/4 -> batched leaf evaluation.
 
@@ -352,7 +393,7 @@ class ExpectimaxSearcher:
         if not tree:
             return int(legal_actions[0]), {a: -1e9 for a in range(4)}
 
-        self._ensure_evaluated(all_leaves, use_d4=use_d4)
+        self._ensure_evaluated(all_leaves, use_d4=use_d4, use_snake=use_snake)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
         for a, (lr, branches) in tree.items():
@@ -367,6 +408,7 @@ class ExpectimaxSearcher:
         bb: int,
         legal_actions: Sequence[int],
         use_d4: bool = False,
+        use_snake: bool = True,
     ) -> Tuple[int, Dict[int, float]]:
         """3-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Leaf Evaluation.
 
@@ -428,9 +470,9 @@ class ExpectimaxSearcher:
             tree[a1] = (lr1, chance_branches)
 
         if not tree:
-            return self._search_depth_2(bb, legal_actions, use_d4=use_d4)
+            return self._search_depth_2(bb, legal_actions, use_d4=use_d4, use_snake=use_snake)
 
-        self._ensure_evaluated(all_leaves, use_d4=use_d4)
+        self._ensure_evaluated(all_leaves, use_d4=use_d4, use_snake=use_snake)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
         for a1, (lr1, chance_branches) in tree.items():
@@ -454,10 +496,15 @@ class ExpectimaxSearcher:
         bb: int,
         legal_actions: Sequence[int],
         use_d4: bool = False,
+        use_snake: bool = True,
     ) -> Tuple[int, Dict[int, float]]:
         """4-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Leaf Evaluation.
 
-        Applies probability pruning (pruning branches with p < 0.001) and beam search.
+        Applies deep chance node pruning:
+            - Chance 1 (ply 2): if empty cells > 4, prioritizes top-4 perimeter cells.
+            - Chance 2 (ply 4): if empty cells > 4, prunes to top-3 most constrained/edge-adjacent empty cells.
+            - Chance 2 (ply 4): only expands spawn tile 2 (weight 1.0) and prunes tile 4 unless empty cells <= 2.
+            - Probability pruning (pruning branches with p < 0.001).
         """
         all_leaves: List[int] = []
         # tree: a1 -> (lr1, list of (w_chance1, list of (lr2, list of (w_chance2, s_leaf))))
@@ -466,7 +513,6 @@ class ExpectimaxSearcher:
         max_chance1 = (
             4 if self.max_empty_samples is None else min(4, self.max_empty_samples)
         )
-        max_chance2 = 4
 
         for a1 in legal_actions:
             nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
@@ -480,11 +526,11 @@ class ExpectimaxSearcher:
                 all_leaves.append(nb1)
                 continue
 
-            sampled1 = (
-                np.random.choice(empty1, max_chance1, replace=False)
-                if num_empty1 > max_chance1
-                else empty1
-            )
+            if num_empty1 > max_chance1:
+                sampled1 = sorted(empty1, key=_PRIORITY_ORDER.get)[:max_chance1]
+            else:
+                sampled1 = empty1
+
             w_base1 = 1.0 / len(sampled1)
             chance1_branches = []
 
@@ -512,18 +558,27 @@ class ExpectimaxSearcher:
                             all_leaves.append(nb2)
                             continue
 
-                        sampled2 = (
-                            np.random.choice(empty2, max_chance2, replace=False)
-                            if num_empty2 > max_chance2
-                            else empty2
-                        )
-                        w_base2 = 1.0 / len(sampled2)
-                        chance2_branches = []
+                        # Deep chance pruning:
+                        # 1. If empty cells > 4, expand only top-3 most constrained cells
+                        if num_empty2 > 4:
+                            sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:3]
+                        elif self.max_empty_samples is not None and num_empty2 > self.max_empty_samples:
+                            sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:self.max_empty_samples]
+                        else:
+                            sampled2 = empty2
 
+                        w_base2 = 1.0 / len(sampled2)
+
+                        # 2. At deep ply >= 3, only expand spawn tile 2 (weight 1.0); prune tile 4 unless empty cells <= 2
+                        if num_empty2 > 2:
+                            spawn_candidates = [(2, 1.0)]
+                        else:
+                            spawn_candidates = [(2, 0.90), (4, 0.10)]
+
+                        chance2_branches = []
                         for c2 in sampled2:
-                            for val2, p2 in [(2, 0.90), (4, 0.10)]:
+                            for val2, p2 in spawn_candidates:
                                 p_branch = w1 * (p2 * w_base2)
-                                # Probability pruning: skip branches with negligible cumulative probability
                                 if p_branch < 0.001 and val2 == 4:
                                     continue
 
@@ -540,9 +595,9 @@ class ExpectimaxSearcher:
             tree[a1] = (lr1, chance1_branches)
 
         if not tree:
-            return self._search_depth_3(bb, legal_actions, use_d4=use_d4)
+            return self._search_depth_3(bb, legal_actions, use_d4=use_d4, use_snake=use_snake)
 
-        self._ensure_evaluated(all_leaves, use_d4=use_d4)
+        self._ensure_evaluated(all_leaves, use_d4=use_d4, use_snake=use_snake)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
         for a1, (lr1, chance1_branches) in tree.items():
@@ -575,12 +630,14 @@ class ExpectimaxSearcher:
         self,
         boards: Sequence[Union[np.ndarray, int]],
         use_d4: Optional[bool] = None,
+        use_snake: Optional[bool] = None,
     ) -> np.ndarray:
-        """Evaluate a collection of boards in a single GPU forward pass with optional D4 symmetrization.
+        """Evaluate a collection of boards in a single GPU forward pass with optional D4 and topological shield.
 
         Args:
             boards: Sequence of 4x4 integer boards or 64-bit bitboard integers.
             use_d4: Optional toggle overriding instance setting.
+            use_snake: Optional toggle overriding instance setting.
 
         Returns:
             1D numpy array of values V(s) = max_{a in legal} Q(s, a), or 0.0 if terminal.
@@ -590,6 +647,7 @@ class ExpectimaxSearcher:
             return np.array([], dtype=np.float32)
 
         d4_active = self.use_d4_symmetry if use_d4 is None else use_d4
+        snake_active = self.use_snake_heuristic if use_snake is None else use_snake
 
         first = boards[0]
         if isinstance(first, (int, np.integer)):
@@ -642,7 +700,42 @@ class ExpectimaxSearcher:
                         torch.zeros_like(q_vals[:, 0]),
                     )
 
-            return v_vals.float().cpu().numpy()
+            v_np = v_vals.float().cpu().numpy()
+
+        if snake_active:
+            ranks_flat = exps.reshape(n, 16).astype(np.float32)
+            # Dot product with 8x16 snake templates and take maximum
+            snake_scores = np.max(np.dot(ranks_flat, SNAKE_WEIGHTS_8x16.T), axis=1)
+
+            # Vectorized corner penalty
+            k_max = np.max(ranks_flat, axis=1)
+            is_corner = (
+                (ranks_flat[:, 0] == k_max)
+                | (ranks_flat[:, 3] == k_max)
+                | (ranks_flat[:, 12] == k_max)
+                | (ranks_flat[:, 15] == k_max)
+            )
+            is_interior = (
+                (ranks_flat[:, 5] == k_max)
+                | (ranks_flat[:, 6] == k_max)
+                | (ranks_flat[:, 9] == k_max)
+                | (ranks_flat[:, 10] == k_max)
+            )
+            penalties = np.where(
+                k_max < 7,
+                0.0,
+                np.where(is_corner, 0.0, np.where(is_interior, k_max * 2.0, k_max * 1.0)),
+            )
+
+            has_legal_np = masks_np.any(axis=-1)
+            v_final = np.where(
+                has_legal_np,
+                v_np + self.alpha_snake * snake_scores - self.beta_corner * penalties,
+                0.0,
+            )
+            return v_final.astype(np.float32)
+
+        return v_np
 
 
 def expectimax_search(
@@ -653,6 +746,10 @@ def expectimax_search(
     gamma: float = 0.99,
     max_empty_samples: Optional[int] = None,
     use_d4_symmetry: bool = False,
+    adaptive_depth: bool = False,
+    use_snake_heuristic: bool = True,
+    alpha_snake: float = 0.5,
+    beta_corner: float = 1.0,
 ) -> Tuple[int, Dict[int, float]]:
     """Functional convenience wrapper for ExpectimaxSearcher.search."""
     searcher = ExpectimaxSearcher(
@@ -662,5 +759,15 @@ def expectimax_search(
         depth=depth,
         max_empty_samples=max_empty_samples,
         use_d4_symmetry=use_d4_symmetry,
+        adaptive_depth=adaptive_depth,
+        use_snake_heuristic=use_snake_heuristic,
+        alpha_snake=alpha_snake,
+        beta_corner=beta_corner,
     )
-    return searcher.search(board, depth=depth, use_d4_symmetry=use_d4_symmetry)
+    return searcher.search(
+        board,
+        depth=depth,
+        use_d4_symmetry=use_d4_symmetry,
+        adaptive_depth=adaptive_depth,
+        use_snake_heuristic=use_snake_heuristic,
+    )

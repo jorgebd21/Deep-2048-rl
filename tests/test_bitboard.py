@@ -144,6 +144,91 @@ class TestBitboardCoreParity:
         moves_per_sec = iters / elapsed
         assert moves_per_sec > 200_000, f"Expected >200k moves/sec, got {moves_per_sec:.0f}"
 
+    def test_compute_snake_score_d4_invariance(self):
+        """Snake score must be strictly invariant under all 8 dihedral D4 transformations."""
+        board = np.array([
+            [2048, 1024, 512, 256],
+            [16, 32, 64, 128],
+            [8, 4, 2, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(board)
+        base_score = Bitboard2048.compute_snake_score(bb)
+        assert base_score > 0.0
+
+        for sym_bb in Bitboard2048.get_d4_symmetries(bb):
+            sym_score = Bitboard2048.compute_snake_score(sym_bb)
+            assert np.isclose(base_score, sym_score, atol=1e-5), (
+                f"Symmetry snake score {sym_score} != base {base_score}"
+            )
+
+    def test_compute_corner_penalty(self):
+        """Corner penalty should be 0 in corner, 11 on edge, 22 in interior for 2048 tile."""
+        # Max tile in corner (0,0) -> 0
+        b_corner = np.array([
+            [2048, 1024, 512, 256],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.compute_corner_penalty(Bitboard2048.from_array(b_corner)) == 0.0
+
+        # Max tile on non-corner edge (0,1) -> 11.0
+        b_edge = np.array([
+            [1024, 2048, 512, 256],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.compute_corner_penalty(Bitboard2048.from_array(b_edge)) == 11.0
+
+        # Max tile in interior (1,1) -> 22.0
+        b_interior = np.array([
+            [1024, 512, 256, 128],
+            [64, 2048, 32, 16],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.compute_corner_penalty(Bitboard2048.from_array(b_interior)) == 22.0
+
+        # Max tile < 128 (e.g. 64) -> no penalty even if interior
+        b_low = np.array([
+            [0, 0, 0, 0],
+            [0, 64, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.compute_corner_penalty(Bitboard2048.from_array(b_low)) == 0.0
+
+    def test_adaptive_depth_selection(self):
+        """Adaptive depth must return 2 for open board, 3 for midgame, and 4 for endgame."""
+        # Open board (empty >= 8, max < 1024)
+        b_open = np.array([
+            [2, 4, 8, 16],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.get_adaptive_depth(Bitboard2048.from_array(b_open)) == 2
+
+        # Mid board (empty 6, max < 1024)
+        b_mid = np.array([
+            [2, 4, 8, 16],
+            [32, 64, 128, 256],
+            [2, 4, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.get_adaptive_depth(Bitboard2048.from_array(b_mid)) == 3
+
+        # Critical endgame (empty <= 4, max >= 1024)
+        b_endgame = np.array([
+            [2048, 1024, 512, 256],
+            [128, 64, 32, 16],
+            [8, 4, 2, 4],
+            [2, 0, 0, 0],
+        ], dtype=np.int64)
+        assert Bitboard2048.get_adaptive_depth(Bitboard2048.from_array(b_endgame)) == 4
+
 
 class TestAfterstateLearningAndAugmentation:
     """Validate Afterstate buffer serialization and network loss computations."""

@@ -295,3 +295,76 @@ class TestExpectimaxSearcher:
         assert len(q2) == 4
         mask = Game2048Core().get_action_mask(board)
         assert bool(mask[act2]) is True
+
+    def test_adaptive_depth_search(self, mock_model):
+        """Verify adaptive depth executes properly and returns legal actions."""
+        b_crit = np.array([
+            [2048, 1024, 512, 256],
+            [128, 64, 32, 16],
+            [8, 4, 2, 4],
+            [2, 0, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            adaptive_depth=True,
+            use_d4_symmetry=False,
+        )
+
+        action, q_dict = searcher.search(b_crit)
+        assert 0 <= action <= 3
+        mask = Game2048Core().get_action_mask(b_crit)
+        assert bool(mask[action]) is True
+
+    def test_snake_heuristic_leaf_evaluation(self, mock_model):
+        """Verify topological snake monotonicity and corner penalty blend into leaf evaluations."""
+        b_clean = np.array([
+            [2048, 1024, 512, 256],
+            [16, 32, 64, 128],
+            [8, 4, 2, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+
+        b_displaced = np.array([
+            [1024, 512, 256, 128],
+            [64, 2048, 32, 16],
+            [8, 4, 2, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_snake_heuristic=True,
+            alpha_snake=0.5,
+            beta_corner=1.0,
+        )
+
+        v_clean = searcher._batch_evaluate_boards([b_clean], use_snake=True)[0]
+        v_displaced = searcher._batch_evaluate_boards([b_displaced], use_snake=True)[0]
+
+        # Clean corner snake must evaluate significantly higher than dislodged interior 2048
+        assert v_clean > v_displaced + 10.0
+
+    def test_depth_4_search_with_deep_chance_pruning(self, mock_model):
+        """Verify depth 4 search completes with deep chance pruning."""
+        board = np.array([
+            [1024, 512, 256, 128],
+            [64, 32, 16, 8],
+            [4, 2, 4, 2],
+            [2, 0, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            depth=4,
+            use_d4_symmetry=False,
+            use_snake_heuristic=True,
+        )
+
+        act, q_dict = searcher.search(board, depth=4)
+        assert 0 <= act <= 3
+        mask = Game2048Core().get_action_mask(board)
+        assert bool(mask[act]) is True

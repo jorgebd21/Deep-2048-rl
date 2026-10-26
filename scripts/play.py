@@ -34,7 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
     parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply)")
+    parser.add_argument("--adaptive-depth", action="store_true", default=False, help="Dynamically adjust depth (2-ply early, 3-ply mid, 4-ply endgame)")
     parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
+    parser.add_argument("--use-snake-heuristic", action="store_true", default=True, help="Enable topological snake monotonicity and corner shield (default: True)")
+    parser.add_argument("--no-snake-heuristic", action="store_false", dest="use_snake_heuristic", help="Disable topological snake monotonicity and corner shield")
+    parser.add_argument("--alpha-snake", type=float, default=0.5, help="Weight for snake monotonicity score")
+    parser.add_argument("--beta-corner", type=float, default=1.0, help="Weight for corner dislodgement penalty")
     return parser.parse_args()
 
 
@@ -110,11 +115,31 @@ def play(args: argparse.Namespace) -> None:
     done = False
     step = 0
 
+    searcher = None
+    if args.lookahead_depth > 0 or args.adaptive_depth or args.use_d4_symmetry:
+        from src.agent.search import ExpectimaxSearcher
+        searcher = ExpectimaxSearcher(
+            model=model,
+            device=device,
+            depth=args.lookahead_depth,
+            use_d4_symmetry=args.use_d4_symmetry,
+            adaptive_depth=args.adaptive_depth,
+            use_snake_heuristic=args.use_snake_heuristic,
+            alpha_snake=args.alpha_snake,
+            beta_corner=args.beta_corner,
+        )
+
     while not done:
         clear_screen()
         print("\n" + "=" * 52)
         d4_str = " + D4" if args.use_d4_symmetry else ""
-        mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX{d4_str}" if args.lookahead_depth > 0 else f"GREEDY{d4_str}"
+        snake_str = " + Snake" if args.use_snake_heuristic else ""
+        if args.adaptive_depth:
+            mode_str = f"ADAPTIVE EXPECTIMAX{d4_str}{snake_str}"
+        elif args.lookahead_depth > 0:
+            mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX{d4_str}{snake_str}"
+        else:
+            mode_str = f"GREEDY{d4_str}"
         status = f"TRAINED ({mode_str})" if model_loaded else f"UNTRAINED ({mode_str})"
         print(f"  DEEP 2048 RL LIVE AGENT VIEWER ({status})")
         print("=" * 52 + "\n")
@@ -130,19 +155,14 @@ def play(args: argparse.Namespace) -> None:
         if len(valid_actions) == 0:
             break
 
-        if args.lookahead_depth > 0 or args.use_d4_symmetry:
-            from src.agent.search import ExpectimaxSearcher
-            searcher = ExpectimaxSearcher(
-                model=model,
-                device=device,
-                depth=args.lookahead_depth,
-                use_d4_symmetry=args.use_d4_symmetry,
-            )
+        if searcher is not None:
             selected_action, q_dict = searcher.search(
                 info["board"],
                 action_mask=mask,
                 depth=args.lookahead_depth,
                 use_d4_symmetry=args.use_d4_symmetry,
+                adaptive_depth=args.adaptive_depth,
+                use_snake_heuristic=args.use_snake_heuristic,
             )
             q_vals_raw = np.array([q_dict[a] for a in range(4)], dtype=np.float32)
         else:

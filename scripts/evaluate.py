@@ -27,8 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=100, help="Number of evaluation episodes")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
-    parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply)")
+    parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply)")
+    parser.add_argument("--adaptive-depth", action="store_true", default=False, help="Dynamically adjust depth (2-ply early, 3-ply mid, 4-ply endgame)")
     parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
+    parser.add_argument("--use-snake-heuristic", action="store_true", default=True, help="Enable topological snake monotonicity and corner shield (default: True)")
+    parser.add_argument("--no-snake-heuristic", action="store_false", dest="use_snake_heuristic", help="Disable topological snake monotonicity and corner shield")
+    parser.add_argument("--alpha-snake", type=float, default=0.5, help="Weight for snake monotonicity score")
+    parser.add_argument("--beta-corner", type=float, default=1.0, help="Weight for corner dislodgement penalty")
     parser.add_argument("--max-empty-samples", type=int, default=None, help="Max empty cells to sample per chance node (default: evaluate all empty cells)")
     parser.add_argument("--save-json", type=str, default=None, help="Save evaluation metrics to JSON file")
     return parser.parse_args()
@@ -42,6 +47,10 @@ def evaluate_agent(
     lookahead_depth: int = 0,
     max_empty_samples: Optional[int] = None,
     use_d4_symmetry: bool = False,
+    adaptive_depth: bool = False,
+    use_snake_heuristic: bool = True,
+    alpha_snake: float = 0.5,
+    beta_corner: float = 1.0,
 ) -> Dict[str, Any]:
     """Execute deterministic evaluation runs and compute aggregate performance statistics."""
     dev = device or torch.device("cpu")
@@ -49,13 +58,17 @@ def evaluate_agent(
     env = Game2048Env()
 
     searcher: Optional[ExpectimaxSearcher] = None
-    if lookahead_depth > 0 or use_d4_symmetry:
+    if lookahead_depth > 0 or adaptive_depth or use_d4_symmetry:
         searcher = ExpectimaxSearcher(
             model=model,
             device=dev,
             depth=lookahead_depth,
             max_empty_samples=max_empty_samples,
             use_d4_symmetry=use_d4_symmetry,
+            adaptive_depth=adaptive_depth,
+            use_snake_heuristic=use_snake_heuristic,
+            alpha_snake=alpha_snake,
+            beta_corner=beta_corner,
         )
 
     scores: List[float] = []
@@ -63,7 +76,13 @@ def evaluate_agent(
     steps_list: List[int] = []
 
     d4_str = " + D4 Symmetry" if use_d4_symmetry else ""
-    search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}" if lookahead_depth > 0 else f"pure greedy (0-ply{d4_str})"
+    snake_str = " + Snake Shield" if use_snake_heuristic else ""
+    if adaptive_depth:
+        search_mode_str = f"Adaptive Depth Expectimax{d4_str}{snake_str}"
+    elif lookahead_depth > 0:
+        search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}{snake_str}"
+    else:
+        search_mode_str = f"pure greedy (0-ply{d4_str})"
     print(f"\nRunning {episodes} evaluation episodes with {search_mode_str}...", flush=True)
     start_time = time.time()
 
@@ -120,7 +139,11 @@ def evaluate_agent(
     results = {
         "num_episodes": episodes,
         "lookahead_depth": lookahead_depth,
+        "adaptive_depth": adaptive_depth,
         "use_d4_symmetry": use_d4_symmetry,
+        "use_snake_heuristic": use_snake_heuristic,
+        "alpha_snake": alpha_snake,
+        "beta_corner": beta_corner,
         "elapsed_seconds": round(elapsed, 2),
         "mean_score": float(np.mean(scores_arr)),
         "std_score": float(np.std(scores_arr)),
@@ -133,6 +156,7 @@ def evaluate_agent(
         "reach_1024_rate": float(np.mean(tiles_arr >= 1024)),
         "reach_2048_rate": float(np.mean(tiles_arr >= 2048)),
         "reach_4096_rate": float(np.mean(tiles_arr >= 4096)),
+        "reach_8192_rate": float(np.mean(tiles_arr >= 8192)),
         "tile_distribution": tile_dist,
     }
 
@@ -213,6 +237,10 @@ def main() -> None:
         lookahead_depth=args.lookahead_depth,
         max_empty_samples=args.max_empty_samples,
         use_d4_symmetry=args.use_d4_symmetry,
+        adaptive_depth=args.adaptive_depth,
+        use_snake_heuristic=args.use_snake_heuristic,
+        alpha_snake=args.alpha_snake,
+        beta_corner=args.beta_corner,
     )
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -222,13 +250,20 @@ def main() -> None:
             pass
 
     d4_label = " + D4 Symmetry" if args.use_d4_symmetry else ""
-    search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}" if args.lookahead_depth > 0 else f"Pure Greedy (0-ply{d4_label})"
+    snake_label = " + Snake Shield" if args.use_snake_heuristic else ""
+    if args.adaptive_depth:
+        search_label = f"Adaptive Depth Expectimax{d4_label}{snake_label}"
+    elif args.lookahead_depth > 0:
+        search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}{snake_label}"
+    else:
+        search_label = f"Pure Greedy (0-ply{d4_label})"
     print("\n" + "=" * 65)
     print(f" MONTE CARLO EVALUATION REPORT ({search_label})")
     print("=" * 65)
     print(f"  Episodes Evaluated  : {results['num_episodes']}")
-    print(f"  Lookahead Depth     : {results['lookahead_depth']}")
+    print(f"  Lookahead Depth     : {'Adaptive (2..4)' if results['adaptive_depth'] else results['lookahead_depth']}")
     print(f"  D4 Symmetrization   : {'Enabled' if results['use_d4_symmetry'] else 'Disabled'}")
+    print(f"  Snake Shield        : {'Enabled (alpha={:.2f}, beta={:.2f})'.format(results['alpha_snake'], results['beta_corner']) if results['use_snake_heuristic'] else 'Disabled'}")
     print(f"  Elapsed Time        : {results['elapsed_seconds']:.2f} s")
     print(f"  Mean Score          : {results['mean_score']:.1f} +/- {results['std_score']:.1f}")
     print(f"  Median Score        : {results['median_score']:.1f}")
@@ -240,6 +275,8 @@ def main() -> None:
     print(f"    Reach 512+        : {results['reach_512_rate'] * 100:6.1f}%")
     print(f"    Reach 1024+       : {results['reach_1024_rate'] * 100:6.1f}%")
     print(f"    Reach 2048+       : {results['reach_2048_rate'] * 100:6.1f}%")
+    print(f"    Reach 4096+       : {results['reach_4096_rate'] * 100:6.1f}%")
+    print(f"    Reach 8192+       : {results['reach_8192_rate'] * 100:6.1f}%")
     print("  " + "-" * 45)
     print("  Max Tile Frequency Distribution:")
     for tile, count in sorted(results["tile_distribution"].items()):
