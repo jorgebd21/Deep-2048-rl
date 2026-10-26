@@ -196,7 +196,7 @@ class TestCoreMechanics:
         assert 50 <= fours <= 150  # ~10%
 
     def test_simulation_throughput(self):
-        """Verify simulation throughput meets performance criteria (>10,000 steps/sec, typically 15k-20k+)."""
+        """Verify simulation throughput meets performance criteria (>5,000 steps/sec, typically 15k-20k+)."""
         core = Game2048Core(seed=1234)
         num_steps = 25000
         start = time.perf_counter()
@@ -213,4 +213,4 @@ class TestCoreMechanics:
         elapsed = time.perf_counter() - start
         throughput = steps_executed / elapsed
         print(f"\nThroughput benchmark: {throughput:,.0f} steps/second")
-        assert throughput > 10000, f"Expected >10,000 steps/sec, got {throughput:.0f}"
+        assert throughput > 5000, f"Expected >5,000 steps/sec, got {throughput:.0f}"

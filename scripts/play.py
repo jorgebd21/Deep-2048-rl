@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manual-step", action="store_true", help="Press Enter to execute next move")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
+    parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply)")
     return parser.parse_args()
 
 
@@ -111,7 +112,8 @@ def play(args: argparse.Namespace) -> None:
     while not done:
         clear_screen()
         print("\n" + "=" * 52)
-        status = "TRAINED CHECKPOINT" if model_loaded else "UNTRAINED BASELINE"
+        mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX" if args.lookahead_depth > 0 else "GREEDY"
+        status = f"TRAINED ({mode_str})" if model_loaded else f"UNTRAINED ({mode_str})"
         print(f"  DEEP 2048 RL LIVE AGENT VIEWER ({status})")
         print("=" * 52 + "\n")
 
@@ -126,15 +128,21 @@ def play(args: argparse.Namespace) -> None:
         if len(valid_actions) == 0:
             break
 
-        obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
-        mask_t = torch.from_numpy(mask).bool().unsqueeze(0).to(device)
+        if args.lookahead_depth > 0:
+            from src.agent.search import ExpectimaxSearcher
+            searcher = ExpectimaxSearcher(model=model, device=device, depth=args.lookahead_depth)
+            selected_action, q_dict = searcher.search(info["board"], action_mask=mask)
+            q_vals_raw = np.array([q_dict[a] for a in range(4)], dtype=np.float32)
+        else:
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+            mask_t = torch.from_numpy(mask).bool().unsqueeze(0).to(device)
 
-        with torch.no_grad():
-            q_vals_masked = model(obs_t, action_mask=mask_t).squeeze(0).cpu().numpy()
-            q_vals_raw = model(obs_t).squeeze(0).cpu().numpy()
+            with torch.no_grad():
+                q_vals_masked = model(obs_t, action_mask=mask_t).squeeze(0).cpu().numpy()
+                q_vals_raw = model(obs_t).squeeze(0).cpu().numpy()
 
-        # Greedy legal action
-        selected_action = int(np.argmax(q_vals_masked))
+            # Greedy legal action
+            selected_action = int(np.argmax(q_vals_masked))
 
         # HUD rendering
         print(

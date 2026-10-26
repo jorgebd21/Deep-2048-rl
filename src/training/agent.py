@@ -77,6 +77,8 @@ class DDQNAgent:
         state: Union[np.ndarray, torch.Tensor],
         action_mask: Union[np.ndarray, torch.Tensor],
         deterministic: bool = False,
+        lookahead_depth: int = 0,
+        board: Optional[np.ndarray] = None,
     ) -> int:
         """Select an action following epsilon-greedy policy with strict legal masking.
 
@@ -84,6 +86,8 @@ class DDQNAgent:
             state: Observation tensor of shape (16, 4, 4) or batch (1, 16, 4, 4).
             action_mask: Boolean array of shape (4,) indicating legal actions.
             deterministic: If True, bypass exploration and choose greedy best action.
+            lookahead_depth: Optional search depth (e.g. 2 for 2-ply Expectimax).
+            board: Optional 4x4 integer board array required when lookahead_depth > 0.
 
         Returns:
             Integer action in {0, 1, 2, 3}.
@@ -100,6 +104,17 @@ class DDQNAgent:
         # Exploration branch: select uniformly only among legal actions
         if not deterministic and np.random.rand() < self.epsilon:
             return int(np.random.choice(valid_actions))
+
+        # Lookahead search branch if requested and board provided
+        if lookahead_depth > 0 and board is not None:
+            from src.agent.search import ExpectimaxSearcher
+            searcher = ExpectimaxSearcher(
+                model=self.policy_net,
+                device=self.device,
+                gamma=self.gamma,
+                depth=lookahead_depth,
+            )
+            return searcher.select_action(board, action_mask=mask_np, depth=lookahead_depth)
 
         # Exploitation branch: greedy action selection through online network
         self.policy_net.eval()
