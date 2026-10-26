@@ -3,6 +3,7 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from src.env.wrapper import MAX_TILE_VAL, _POWER_LUT, _IDENTITY_16
 
@@ -75,6 +76,46 @@ class SumTree:
 
         data_idx = curr - self.capacity + 1
         return curr, float(self.tree[curr]), data_idx
+
+    def get_batch(
+        self, values: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Vectorized search from root to leaf for multiple sampled values simultaneously.
+
+        Args:
+            values: 1D array of shape (B,) with cumulative priority values in [0, total_priority].
+
+        Returns:
+            Tuple of:
+                - tree_indices: 1D int64 array of leaf indices in self.tree.
+                - priorities: 1D float64 array of leaf priorities.
+                - data_indices: 1D int64 array of circular data buffer indices [0, capacity - 1].
+        """
+        b = len(values)
+        v = np.array(values, dtype=np.float64, copy=True)
+        curr = np.zeros(b, dtype=np.int64)
+        tree_len = len(self.tree)
+        max_depth = int(np.ceil(np.log2(tree_len)))
+
+        for _ in range(max_depth):
+            left = 2 * curr + 1
+            right = left + 1
+
+            valid_left = left < tree_len
+            if not np.any(valid_left):
+                break
+
+            safe_left = np.minimum(left, tree_len - 1)
+            tree_left = np.where(valid_left, self.tree[safe_left], 0.0)
+            go_left = valid_left & (v <= tree_left)
+            go_right = valid_left & ~go_left
+
+            v = np.where(go_right, v - tree_left, v)
+            safe_right = np.minimum(right, tree_len - 1)
+            curr = np.where(go_left, safe_left, np.where(go_right, safe_right, curr))
+
+        data_idx = np.clip(curr - self.capacity + 1, 0, self.capacity - 1)
+        return curr, self.tree[curr], data_idx
 
 
 def board_to_exponents(board: np.ndarray) -> np.ndarray:
@@ -286,21 +327,15 @@ class PrioritizedReplayBuffer:
         total_p = self.tree.total_priority()
         segment = total_p / batch_size
 
-        tree_indices = np.empty(batch_size, dtype=np.int64)
-        data_indices = np.empty(batch_size, dtype=np.int64)
-        priorities = np.empty(batch_size, dtype=np.float64)
+        # Vectorized sampling segments
+        lows = segment * np.arange(batch_size, dtype=np.float64)
+        highs = segment * np.arange(1, batch_size + 1, dtype=np.float64)
+        vals = np.random.uniform(lows, highs)
 
-        for i in range(batch_size):
-            low = segment * i
-            high = segment * (i + 1)
-            val = np.random.uniform(low, high)
-            tree_idx, prio, data_idx = self.tree.get(val)
+        tree_indices, priorities, data_indices = self.tree.get_batch(vals)
 
-            # Defensive boundary check
-            data_idx = max(0, min(data_idx, self.tree.size - 1))
-            tree_indices[i] = tree_idx
-            data_indices[i] = data_idx
-            priorities[i] = prio
+        # Defensive boundary check
+        data_indices = np.clip(data_indices, 0, max(0, self.tree.size - 1))
 
         # Compute Importance Sampling weights
         # P(i) = p_i / total_p
@@ -309,43 +344,58 @@ class PrioritizedReplayBuffer:
         weights = (self.tree.size * probs) ** (-self.beta)
         weights = weights / (weights.max() + 1e-12)
 
-        # Vectorized One-Hot expansion of uint8 state exponents
+        # Vectorized indexing from circular arrays
         batch_st = self.states[data_indices]
         batch_nst = self.next_states[data_indices]
 
-        # Shape: (B, 4, 4, 16) -> (B, 16, 4, 4)
-        states_one_hot = _IDENTITY_16[batch_st].transpose(0, 3, 1, 2)
-        next_states_one_hot = _IDENTITY_16[batch_nst].transpose(0, 3, 1, 2)
-
         # Convert to tensors
-        states_t = torch.from_numpy(states_one_hot).float()
         actions_t = torch.from_numpy(self.actions[data_indices]).long()
         rewards_t = torch.from_numpy(self.rewards[data_indices]).float()
-        next_states_t = torch.from_numpy(next_states_one_hot).float()
         dones_t = torch.from_numpy(self.dones[data_indices]).float()
         masks_t = torch.from_numpy(self.action_masks[data_indices]).bool()
         next_masks_t = torch.from_numpy(self.next_action_masks[data_indices]).bool()
         weights_t = torch.from_numpy(weights.astype(np.float32)).float()
 
-        if device is not None:
-            if device.type == "cuda" and pin_memory:
-                states_t = states_t.pin_memory()
+        if device is not None and device.type == "cuda":
+            # Fast compact uint8 PCIe transfer (8 KB) + high-bandwidth GPU one-hot expansion
+            st_raw = torch.from_numpy(batch_st)
+            nst_raw = torch.from_numpy(batch_nst)
+            if pin_memory:
+                st_raw = st_raw.pin_memory()
+                nst_raw = nst_raw.pin_memory()
                 actions_t = actions_t.pin_memory()
                 rewards_t = rewards_t.pin_memory()
-                next_states_t = next_states_t.pin_memory()
                 dones_t = dones_t.pin_memory()
                 masks_t = masks_t.pin_memory()
                 next_masks_t = next_masks_t.pin_memory()
                 weights_t = weights_t.pin_memory()
 
-            states_t = states_t.to(device, non_blocking=True)
+            st_gpu = st_raw.to(device, non_blocking=True)
+            nst_gpu = nst_raw.to(device, non_blocking=True)
+            states_t = F.one_hot(st_gpu.long(), num_classes=16).permute(0, 3, 1, 2).float()
+            next_states_t = F.one_hot(nst_gpu.long(), num_classes=16).permute(0, 3, 1, 2).float()
+
             actions_t = actions_t.to(device, non_blocking=True)
             rewards_t = rewards_t.to(device, non_blocking=True)
-            next_states_t = next_states_t.to(device, non_blocking=True)
             dones_t = dones_t.to(device, non_blocking=True)
             masks_t = masks_t.to(device, non_blocking=True)
             next_masks_t = next_masks_t.to(device, non_blocking=True)
             weights_t = weights_t.to(device, non_blocking=True)
+        else:
+            # CPU fallback expansion
+            states_one_hot = _IDENTITY_16[batch_st].transpose(0, 3, 1, 2)
+            next_states_one_hot = _IDENTITY_16[batch_nst].transpose(0, 3, 1, 2)
+            states_t = torch.from_numpy(states_one_hot).float()
+            next_states_t = torch.from_numpy(next_states_one_hot).float()
+            if device is not None:
+                states_t = states_t.to(device)
+                actions_t = actions_t.to(device)
+                rewards_t = rewards_t.to(device)
+                next_states_t = next_states_t.to(device)
+                dones_t = dones_t.to(device)
+                masks_t = masks_t.to(device)
+                next_masks_t = next_masks_t.to(device)
+                weights_t = weights_t.to(device)
 
         return {
             "states": states_t,

@@ -120,6 +120,61 @@ class DDQNAgent:
 
         return best_action
 
+    def select_actions_batch(
+        self,
+        states: Union[np.ndarray, torch.Tensor],
+        action_masks: Union[np.ndarray, torch.Tensor],
+        deterministic: bool = False,
+    ) -> np.ndarray:
+        """Select actions for a batch of N environments concurrently.
+
+        Executes a single batched GPU forward pass with legal action masking.
+
+        Args:
+            states: Batch of observations (N, 16, 4, 4) or uint8 boards (N, 4, 4).
+            action_masks: (N, 4) boolean array of legal moves.
+            deterministic: If True, bypass exploration and pick argmax action.
+
+        Returns:
+            1D NumPy array of shape (N,) containing selected integer actions.
+        """
+        if isinstance(action_masks, torch.Tensor):
+            masks_np = action_masks.detach().cpu().numpy().astype(bool)
+            masks_t = action_masks.bool().to(self.device, non_blocking=True)
+        else:
+            masks_np = np.asarray(action_masks, dtype=bool)
+            masks_t = torch.from_numpy(masks_np).bool().to(self.device, non_blocking=True)
+
+        n = len(masks_np)
+
+        self.policy_net.eval()
+        with torch.no_grad():
+            if isinstance(states, np.ndarray):
+                if states.ndim == 3 and states.shape[1:] == (4, 4):
+                    if states.dtype != np.uint8:
+                        from src.memory.replay_buffer import board_to_exponents
+                        st_exp = board_to_exponents(states)
+                    else:
+                        st_exp = states
+                    st_raw = torch.from_numpy(st_exp).to(self.device, non_blocking=True)
+                    s_t = F.one_hot(st_raw.long(), num_classes=16).permute(0, 3, 1, 2).float()
+                else:
+                    s_t = torch.from_numpy(states).float().to(self.device, non_blocking=True)
+            else:
+                s_t = states.float().to(self.device, non_blocking=True)
+
+            q_values = self.policy_net(s_t, action_mask=masks_t)
+            best_actions = q_values.argmax(dim=-1).cpu().numpy()
+
+        if not deterministic and self.epsilon > 0.0:
+            explore_mask = np.random.rand(n) < self.epsilon
+            for idx in np.flatnonzero(explore_mask):
+                valid = np.flatnonzero(masks_np[idx])
+                if len(valid) > 0:
+                    best_actions[idx] = int(np.random.choice(valid))
+
+        return best_actions
+
     def compute_td_loss(
         self, batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
