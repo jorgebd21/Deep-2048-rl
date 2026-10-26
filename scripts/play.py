@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -35,6 +36,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_checkpoint_path(path: Optional[str]) -> Optional[str]:
+    """Resolve checkpoint file path with alias and directory fallbacks.
+
+    Args:
+        path: User-provided checkpoint path or filename.
+
+    Returns:
+        Resolved absolute or relative path, or None if path is None.
+
+    Raises:
+        FileNotFoundError: If a non-None path cannot be resolved to an existing file.
+    """
+    if path is None:
+        return None
+
+    candidates = [
+        path,
+        os.path.join("checkpoints", path),
+        os.path.join("checkpoints", os.path.basename(path)),
+    ]
+
+    base = os.path.basename(path)
+    if "best_model" in base:
+        candidates.append(path.replace("best_model", "checkpoint_best"))
+        candidates.append(os.path.join("checkpoints", "checkpoint_best.pt"))
+    elif "checkpoint_best" in base:
+        candidates.append(path.replace("checkpoint_best", "best_model"))
+        candidates.append(os.path.join("checkpoints", "best_model.pt"))
+
+    for c in candidates:
+        if os.path.exists(c) and os.path.isfile(c):
+            return c
+
+    available = os.listdir("checkpoints") if os.path.exists("checkpoints") else []
+    raise FileNotFoundError(
+        f"Checkpoint file '{path}' not found. Available files in 'checkpoints/': {available}"
+    )
+
+
 def play(args: argparse.Namespace) -> None:
     """Run interactive playback loop."""
     setup_ampere_tf32()
@@ -50,19 +90,20 @@ def play(args: argparse.Namespace) -> None:
     model = Dueling2048Net(in_channels=16, num_actions=4).to(device)
     model_loaded = False
 
-    if args.checkpoint is not None and os.path.exists(args.checkpoint):
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        state_dict = checkpoint.get("policy_net_state_dict", checkpoint)
-        model.load_state_dict(state_dict)
-        model_loaded = True
-        print(f"Loaded checkpoint from: {args.checkpoint}")
-    else:
-        if args.checkpoint is not None:
-            print(f"Warning: Checkpoint '{args.checkpoint}' not found. Using untrained policy.")
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
+    if checkpoint_path is not None:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get("policy_net_state_dict", checkpoint.get("model_state_dict", checkpoint))
         else:
-            print("No checkpoint specified. Running with untrained baseline policy.")
-
-    model.eval()
+            state_dict = checkpoint
+        model.load_state_dict(state_dict)
+        model.eval()
+        model_loaded = True
+        print(f"Loaded weights successfully from {checkpoint_path}")
+    else:
+        model.eval()
+        print("No checkpoint specified. Running with untrained baseline policy.")
 
     done = False
     step = 0

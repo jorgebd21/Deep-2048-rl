@@ -6,7 +6,7 @@ import torch
 
 from src.models.dueling_dqn import Dueling2048Net
 from src.utils.visualizer import format_tile, render_board_ansi, render_hud
-from scripts.evaluate import evaluate_agent
+from scripts.evaluate import evaluate_agent, resolve_checkpoint_path
 
 
 class TestVisualizer:
@@ -89,3 +89,18 @@ class TestEvaluationRunner:
         assert "tile_distribution" in results
         assert isinstance(results["tile_distribution"], dict)
         assert 0.0 <= results["reach_256_rate"] <= 1.0
+
+    def test_resolve_checkpoint_path_valid_and_fallback(self) -> None:
+        """Verify checkpoint resolution finds existing checkpoints and aliases."""
+        assert resolve_checkpoint_path(None) is None
+
+        # Verify resolution for existing files or aliases in checkpoints/
+        resolved_best = resolve_checkpoint_path("checkpoints/checkpoint_best.pt")
+        assert resolved_best is not None
+
+        resolved_alias = resolve_checkpoint_path("best_model.pt")
+        assert resolved_alias is not None
+
+        # Non-existent checkpoint must raise FileNotFoundError
+        with pytest.raises(FileNotFoundError):
+            resolve_checkpoint_path("non_existent_model_xyz.pt")
