@@ -14,30 +14,10 @@ class Action(IntEnum):
     DOWN = 3
 
 
-def slide_and_merge_row(row: np.ndarray) -> Tuple[np.ndarray, int, float]:
-    """Pure optimized primitive to slide and merge a single row of length 4 to the left.
-
-    Adheres strictly to standard 2048 collision rules:
-    - Non-zero values compact to the left.
-    - Identical adjacent pairs collapse left-to-right.
-    - Each tile can merge at most once per turn ([2, 2, 2, 2] -> [4, 4, 0, 0]).
-    - Yields raw points (sum of merged values) and log-scaled reward (sum of log2(merged values)).
-
-    Args:
-        row: 1D array of length 4 containing tile values.
-
-    Returns:
-        Tuple containing:
-            - new_row: 1D numpy array of length 4 after sliding and merging.
-            - merge_score: Raw sum of newly merged tile values.
-            - log_reward: Sum of log2 of newly merged tile values.
-    """
-    a = int(row[0])
-    b = int(row[1])
-    c = int(row[2])
-    d = int(row[3])
-
-    # Unrolled extraction of non-zero tiles
+def _slide_and_merge_4(
+    a: int, b: int, c: int, d: int
+) -> Tuple[int, int, int, int, int, float]:
+    """Pure fast primitive returning (o0, o1, o2, o3, merge_score, log_reward)."""
     v0, v1, v2, v3 = 0, 0, 0, 0
     n = 0
     if a:
@@ -69,10 +49,10 @@ def slide_and_merge_row(row: np.ndarray) -> Tuple[np.ndarray, int, float]:
         n += 1
 
     if n == 0:
-        return np.zeros(4, dtype=row.dtype), 0, 0.0
+        return 0, 0, 0, 0, 0, 0.0
 
     vals = (v0, v1, v2, v3)
-    out0, out1, out2, out3 = 0, 0, 0, 0
+    o0, o1, o2, o3 = 0, 0, 0, 0
     score = 0
     log_reward = 0.0
 
@@ -85,29 +65,52 @@ def slide_and_merge_row(row: np.ndarray) -> Tuple[np.ndarray, int, float]:
             score += merged
             log_reward += math.log2(merged)
             if idx == 0:
-                out0 = merged
+                o0 = merged
             elif idx == 1:
-                out1 = merged
+                o1 = merged
             elif idx == 2:
-                out2 = merged
+                o2 = merged
             elif idx == 3:
-                out3 = merged
+                o3 = merged
             idx += 1
             i += 2
         else:
             if idx == 0:
-                out0 = curr
+                o0 = curr
             elif idx == 1:
-                out1 = curr
+                o1 = curr
             elif idx == 2:
-                out2 = curr
+                o2 = curr
             elif idx == 3:
-                out3 = curr
+                o3 = curr
             idx += 1
             i += 1
 
-    res = np.array([out0, out1, out2, out3], dtype=row.dtype)
-    return res, score, log_reward
+    return o0, o1, o2, o3, score, log_reward
+
+
+def slide_and_merge_row(row: np.ndarray) -> Tuple[np.ndarray, int, float]:
+    """Pure optimized primitive to slide and merge a single row of length 4 to the left.
+
+    Adheres strictly to standard 2048 collision rules:
+    - Non-zero values compact to the left.
+    - Identical adjacent pairs collapse left-to-right.
+    - Each tile can merge at most once per turn ([2, 2, 2, 2] -> [4, 4, 0, 0]).
+    - Yields raw points (sum of merged values) and log-scaled reward (sum of log2(merged values)).
+
+    Args:
+        row: 1D array of length 4 containing tile values.
+
+    Returns:
+        Tuple containing:
+            - new_row: 1D numpy array of length 4 after sliding and merging.
+            - merge_score: Raw sum of newly merged tile values.
+            - log_reward: Sum of log2 of newly merged tile values.
+    """
+    o0, o1, o2, o3, score, log_reward = _slide_and_merge_4(
+        int(row[0]), int(row[1]), int(row[2]), int(row[3])
+    )
+    return np.array([o0, o1, o2, o3], dtype=row.dtype), score, log_reward
 
 
 def _row_changes_on_left_slide(a: int, b: int, c: int, d: int) -> bool:
@@ -214,10 +217,18 @@ class Game2048Core:
         total_log_reward = 0.0
 
         for r in range(4):
-            merged_row, score_row, log_r_row = slide_and_merge_row(oriented[r])
-            new_oriented[r] = merged_row
-            total_merge_score += score_row
-            total_log_reward += log_r_row
+            o0, o1, o2, o3, s_r, lr_r = _slide_and_merge_4(
+                int(oriented[r, 0]),
+                int(oriented[r, 1]),
+                int(oriented[r, 2]),
+                int(oriented[r, 3]),
+            )
+            new_oriented[r, 0] = o0
+            new_oriented[r, 1] = o1
+            new_oriented[r, 2] = o2
+            new_oriented[r, 3] = o3
+            total_merge_score += s_r
+            total_log_reward += lr_r
 
         changed = not np.array_equal(oriented, new_oriented)
 
