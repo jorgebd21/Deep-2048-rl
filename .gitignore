@@ -59,3 +59,9 @@ htmlcov/
 # Temporary / Scratch
 tmp/
 *.log
+
+# Internal planning and agent instructions
+GEMINI.md
+proyecto_2048_con_reinforcement_learning.md
+roadmap_de_implementaci_n.md
+informe_proyecto_2048_rl.md
