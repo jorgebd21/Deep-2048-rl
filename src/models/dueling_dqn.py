@@ -1,5 +1,6 @@
 """Dueling Deep Q-Network (Dueling2048Net) architecture for 2048."""
 
+import os
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -104,3 +105,47 @@ class Dueling2048Net(nn.Module):
             q_values = torch.where(mask_bool, q_values, neg_inf)
 
         return q_values
+
+
+def export_to_onnx(
+    model: Dueling2048Net,
+    output_path: str,
+    dynamic_batch: bool = True,
+    opset_version: int = 17,
+) -> str:
+    """Export Dueling2048Net to ONNX format with dynamic batch axes.
+
+    Args:
+        model: Trained or initialized Dueling2048Net instance.
+        output_path: Filepath where the .onnx model will be written.
+        dynamic_batch: Whether to assign dynamic batch dimension.
+        opset_version: ONNX operator set version.
+
+    Returns:
+        Absolute filepath to the saved ONNX model.
+    """
+    model.eval()
+    cpu_model = model.to("cpu")
+    dummy_input = torch.randn(1, model.in_channels, 4, 4, dtype=torch.float32)
+
+    dynamic_axes = None
+    if dynamic_batch:
+        dynamic_axes = {
+            "observation": {0: "batch_size"},
+            "q_values": {0: "batch_size"},
+        }
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+    torch.onnx.export(
+        cpu_model,
+        dummy_input,
+        output_path,
+        export_params=True,
+        opset_version=opset_version,
+        do_constant_folding=True,
+        input_names=["observation"],
+        output_names=["q_values"],
+        dynamic_axes=dynamic_axes,
+    )
+    return os.path.abspath(output_path)
