@@ -70,3 +70,66 @@ def get_gpu_telemetry() -> Dict[str, Any]:
         "reserved_mb": round(reserved, 2),
         "total_mb": round(total, 2),
     }
+
+
+_D4_PERMUTATIONS_LIST = [
+    [0, 1, 2, 3],  # rot0: identity (LEFT, RIGHT, UP, DOWN)
+    [2, 3, 1, 0],  # rot1: rot90
+    [1, 0, 3, 2],  # rot2: rot180
+    [3, 2, 0, 1],  # rot3: rot270
+    [1, 0, 2, 3],  # flip_rot0: flip horizontal
+    [2, 3, 0, 1],  # flip_rot1: flip + rot90
+    [0, 1, 3, 2],  # flip_rot2: flip + rot180
+    [3, 2, 1, 0],  # flip_rot3: flip + rot270
+]
+
+
+def apply_random_d4_augmentation(
+    batch: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Apply a random Dihedral D4 transformation to an experience mini-batch on GPU.
+
+    In 2048, game dynamics are isometric under 90-degree rotations and horizontal/vertical
+    reflections. Transforming the batch randomly enforces rotation and reflection invariance
+    in policy and value weights without extra memory consumption.
+
+    Args:
+        batch: Dictionary containing mini-batch tensors ('states', 'next_states', etc.)
+
+    Returns:
+        Augmented batch dictionary with transformed tensors.
+    """
+    k = int(torch.randint(0, 8, (1,)).item())
+    if k == 0:
+        return batch  # Identity transformation
+
+    perm = _D4_PERMUTATIONS_LIST[k]
+    st = batch["states"]
+    nst = batch["next_states"]
+
+    # Symmetries 4..7 incorporate a horizontal flip
+    if k >= 4:
+        st = torch.flip(st, [-1])
+        nst = torch.flip(nst, [-1])
+
+    rot_steps = k % 4
+    if rot_steps > 0:
+        st = torch.rot90(st, rot_steps, [-2, -1])
+        nst = torch.rot90(nst, rot_steps, [-2, -1])
+
+    batch["states"] = st
+    batch["next_states"] = nst
+
+    # Transform discrete actions if present in batch
+    if "actions" in batch and batch["actions"] is not None:
+        perm_t = torch.tensor(perm, dtype=torch.long, device=batch["actions"].device)
+        batch["actions"] = perm_t[batch["actions"]]
+
+    # Transform action masks if present
+    if "action_masks" in batch and batch["action_masks"] is not None:
+        batch["action_masks"] = batch["action_masks"][:, perm]
+
+    if "next_action_masks" in batch and batch["next_action_masks"] is not None:
+        batch["next_action_masks"] = batch["next_action_masks"][:, perm]
+
+    return batch

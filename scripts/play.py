@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manual-step", action="store_true", help="Press Enter to execute next move")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
-    parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply)")
+    parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply)")
     parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
     return parser.parse_args()
 

@@ -430,3 +430,49 @@ class PrioritizedReplayBuffer:
             self.tree.update(int(tree_idx), float(prio))
             if float(prio) > self.max_priority:
                 self.max_priority = float(prio)
+
+    def add_afterstate(
+        self,
+        afterstate: np.ndarray,
+        reward: float,
+        next_afterstate: np.ndarray,
+        done: bool,
+        priority: Optional[float] = None,
+    ) -> None:
+        """Store an afterstate transition (s_after, r_next, s'_after, done) into PER.
+
+        Args:
+            afterstate: 4x4 array of tile values or packed exponents after player action.
+            reward: Merge reward earned between afterstates.
+            next_afterstate: Resulting 4x4 afterstate following nature spawn and next action.
+            done: Terminal flag.
+            priority: Optional priority override.
+        """
+        dummy_mask = np.ones(4, dtype=bool)
+        self.add(
+            state=afterstate,
+            action=0,
+            reward=reward,
+            next_state=next_afterstate,
+            done=done,
+            action_mask=dummy_mask,
+            next_action_mask=dummy_mask,
+            priority=priority,
+        )
+
+    def sample_afterstate(
+        self,
+        batch_size: int,
+        device: Optional[torch.device] = None,
+        pin_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Sample a prioritized mini-batch for afterstate value learning."""
+        batch = self.sample(batch_size=batch_size, device=device, pin_memory=pin_memory)
+        return {
+            "states": batch["states"],
+            "rewards": batch["rewards"],
+            "next_states": batch["next_states"],
+            "dones": batch["dones"],
+            "weights": batch["weights"],
+            "indices": batch["indices"],
+        }

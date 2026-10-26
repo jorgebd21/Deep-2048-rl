@@ -37,6 +37,7 @@ class TrainingConfig:
     log_dir: Optional[str] = None
     pin_memory: bool = True
     use_tqdm: bool = True
+    d4_augmentation: bool = True
 
 
 class Trainer:
@@ -224,6 +225,9 @@ class Trainer:
             device=self.agent.device,
             pin_memory=self.config.pin_memory,
         )
+        if self.config.d4_augmentation:
+            from src.utils.cuda_utils import apply_random_d4_augmentation
+            batch = apply_random_d4_augmentation(batch)
         loss, td_errors = self.agent.update(batch)
         self.total_opt_steps += 1
 

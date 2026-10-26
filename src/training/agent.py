@@ -284,6 +284,63 @@ class DDQNAgent:
 
         return loss_val, td_errors.detach().cpu().numpy()
 
+    def compute_afterstate_loss(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Afterstate Value loss: L = w * Huber(V(s_after) - (r + (1-done) * gamma * V_target(s'_after))).
+
+        Directly trains scalar state-value representation V(s_after) eliminating action space noise.
+
+        Args:
+            batch: Dictionary containing 'states' (afterstate), 'rewards' (next reward),
+                'next_states' (next afterstate), 'dones', and 'weights'.
+
+        Returns:
+            Tuple of (weighted_loss, td_errors).
+        """
+        states = batch["states"].to(self.device)
+        rewards = batch["rewards"].to(self.device)
+        next_states = batch["next_states"].to(self.device)
+        dones = batch["dones"].to(self.device)
+        weights = batch["weights"].to(self.device)
+
+        # Online afterstate evaluation
+        v_pred = self.policy_net.forward_value(states)
+
+        # Target network afterstate evaluation
+        with torch.no_grad():
+            v_next_target = self.target_net.forward_value(next_states)
+            target = rewards + (1.0 - dones) * self.gamma * v_next_target
+
+        td_errors = torch.abs(target - v_pred)
+        elementwise_loss = F.smooth_l1_loss(v_pred, target, reduction="none", beta=1.0)
+        weighted_loss = (elementwise_loss * weights).mean()
+
+        self.last_metrics["mean_q"] = float(v_pred.detach().mean().item())
+        self.last_metrics["mean_td_error"] = float(td_errors.detach().mean().item())
+
+        return weighted_loss, td_errors
+
+    def update_afterstate(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[float, np.ndarray]:
+        """Perform one optimization step using afterstate value learning."""
+        self.policy_net.train()
+        self.optimizer.zero_grad()
+
+        loss, td_errors = self.compute_afterstate_loss(batch)
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            self.policy_net.parameters(), max_norm=self.max_grad_norm
+        )
+        self.optimizer.step()
+
+        loss_val = float(loss.item())
+        self.last_metrics["loss"] = loss_val
+
+        return loss_val, td_errors.detach().cpu().numpy()
+
     def get_last_metrics(self) -> Dict[str, float]:
         """Return the most recent optimization metrics dictionary."""
         return self.last_metrics.copy()

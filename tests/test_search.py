@@ -121,6 +121,52 @@ class TestExpectimaxSearcher:
         mask = Game2048Core().get_action_mask(board)
         assert bool(mask[action]) is True
 
+    def test_depth_4_search(self, mock_model):
+        """Depth 4 should execute 4-ply search with probability pruning and pick legal action."""
+        board = np.array([
+            [2, 4, 8, 16],
+            [0, 2, 0, 4],
+            [0, 0, 2, 0],
+            [0, 0, 0, 2],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            depth=4,
+            max_empty_samples=2,
+        )
+        action, q_dict = searcher.search(board, depth=4)
+
+        mask = Game2048Core().get_action_mask(board)
+        assert bool(mask[action]) is True
+        assert len(searcher.tt) > 0
+
+    def test_transposition_table_caching(self, mock_model):
+        """Transposition Table should cache canonical evaluations across moves."""
+        board = np.array([
+            [2, 2, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            depth=2,
+        )
+        searcher.search(board, depth=2)
+        initial_tt_size = len(searcher.tt)
+        assert initial_tt_size > 0
+
+        # Searching same board again should not require new entries
+        searcher.search(board, depth=2)
+        assert len(searcher.tt) == initial_tt_size
+
+        searcher.clear_tt()
+        assert len(searcher.tt) == 0
+
     def test_terminal_state_handling(self, mock_model):
         """Terminal board with no legal actions should return fallback action 0."""
         # Full board with no adjacent matches

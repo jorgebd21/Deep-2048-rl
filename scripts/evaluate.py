@@ -64,10 +64,11 @@ def evaluate_agent(
 
     d4_str = " + D4 Symmetry" if use_d4_symmetry else ""
     search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}" if lookahead_depth > 0 else f"pure greedy (0-ply{d4_str})"
-    print(f"\nRunning {episodes} evaluation episodes with {search_mode_str}...")
+    print(f"\nRunning {episodes} evaluation episodes with {search_mode_str}...", flush=True)
     start_time = time.time()
 
     for ep in range(1, episodes + 1):
+        ep_start = time.time()
         obs, info = env.reset(seed=seed + ep)
         done = False
         step = 0
@@ -96,10 +97,17 @@ def evaluate_agent(
         max_tiles.append(int(info["max_tile"]))
         steps_list.append(step)
 
-        if ep % 10 == 0 or ep == episodes:
-            print(f"  Completed {ep:3d}/{episodes} episodes | "
-                  f"Mean Score: {np.mean(scores):.1f} | "
-                  f"Max Tile: {max(max_tiles)}")
+        ep_duration = max(0.001, time.time() - ep_start)
+        reach_2048_running = np.mean(np.array(max_tiles) >= 2048) * 100.0
+        print(
+            f"  Episode {ep:2d}/{episodes} | "
+            f"Score: {scores[-1]:6.0f} | "
+            f"Max Tile: {max_tiles[-1]:4d} | "
+            f"Steps: {step:4d} ({step/ep_duration:4.1f} steps/s) | "
+            f"Mean Score: {np.mean(scores):6.1f} | "
+            f"2048 Rate: {reach_2048_running:4.1f}%",
+            flush=True,
+        )
 
     elapsed = time.time() - start_time
     tiles_arr = np.array(max_tiles)

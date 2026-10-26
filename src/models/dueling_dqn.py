@@ -107,6 +107,27 @@ class Dueling2048Net(nn.Module):
 
         return q_values
 
+    def forward_value(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute scalar state/afterstate value V(s) directly through the value stream.
+
+        Used for Afterstate Value Learning where V(s_after) represents expected return
+        independent of action noise.
+
+        Args:
+            x: Batch of one-hot encoded boards of shape (B, 16, 4, 4).
+
+        Returns:
+            Tensor of shape (B,) containing predicted scalar values V(s).
+        """
+        h = self.leaky_relu(self.conv_horiz(x)).flatten(1)
+        v = self.leaky_relu(self.conv_vert(x)).flatten(1)
+        s = self.leaky_relu(self.conv_sq(x)).flatten(1)
+        k = self.leaky_relu(self.conv_skip(x)).flatten(1)
+
+        features = torch.cat([h, v, s, k], dim=1)
+        shared = self.fc_shared(features)
+        return self.value_stream(shared).squeeze(-1)
+
 
 def export_to_onnx(
     model: Dueling2048Net,

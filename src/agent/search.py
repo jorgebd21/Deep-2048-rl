@@ -2,17 +2,21 @@
 
 Implements batched n-ply Expectimax search over deterministic slide-and-merge
 actions and stochastic tile spawns (90% for 2, 10% for 4). Evaluates leaf states
-using a trained Dueling Double DQN network in a single GPU forward pass with optional
-Dihedral D4 (8-fold rotation/reflection) symmetry invariance.
+using a trained Dueling Double DQN network in a single GPU forward pass with:
+    - 64-bit Bitboard simulation engine with precomputed 16-bit LUTs.
+    - Transposition Table (TT) with 64-bit canonical Dihedral D4 keys.
+    - Dihedral D4 (8-fold rotation/reflection) symmetry invariance.
+    - Probability pruning (p < 0.001) and beam search.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.env.core import Action, Game2048Core
+from src.env.bitboard import Bitboard2048
 from src.env.wrapper import _POWER_LUT, MAX_TILE_VAL, one_hot_encode_board
 from src.utils.cuda_utils import get_device
 
@@ -29,6 +33,8 @@ _D4_ACTION_PERMUTATIONS = [
     [0, 1, 3, 2],  # flip_rot2: flip + rot180
     [3, 2, 1, 0],  # flip_rot3: flip + rot270
 ]
+
+_SHIFTS_64 = np.arange(0, 64, 4, dtype=np.uint64).reshape(1, 16)
 
 
 def generate_d4_tensors(x: torch.Tensor) -> torch.Tensor:
@@ -67,13 +73,15 @@ def generate_d4_masks(masks: torch.Tensor) -> torch.Tensor:
 
 
 class ExpectimaxSearcher:
-    """High-throughput Expectimax searcher leveraging batched neural network evaluation.
+    """High-throughput Expectimax searcher leveraging bitboard simulations and batched GPU evaluation.
 
     Supports:
         - Depth 0: Pure greedy evaluation via direct Q(s, a) forward pass.
         - Depth 1: 1-ply lookahead (action slide -> evaluate afterstate).
         - Depth 2: 2-ply Expectimax (action slide -> chance spawns 2/4 -> evaluate leaf states).
-        - Depth 3: 3-ply Expectimax (action -> chance -> next action -> evaluate leaf states).
+        - Depth 3: 3-ply Expectimax (action 1 -> chance 1 -> action 2 -> evaluate leaf states).
+        - Depth 4: 4-ply Expectimax (action 1 -> chance 1 -> action 2 -> chance 2 -> evaluate leaf states).
+        - Transposition Table (TT) with 64-bit canonical Dihedral D4 hashing.
         - Dihedral D4 Symmetry: 8-fold isometric ensembling for rotation/reflection invariance.
     """
 
@@ -85,6 +93,7 @@ class ExpectimaxSearcher:
         depth: int = 2,
         max_empty_samples: Optional[int] = None,
         use_d4_symmetry: bool = False,
+        tt_max_size: int = 500_000,
     ) -> None:
         """Initialize searcher with model and search configuration.
 
@@ -92,10 +101,11 @@ class ExpectimaxSearcher:
             model: PyTorch policy or Q-network (e.g. Dueling2048Net).
             device: Compute device (defaults to GPU if available).
             gamma: Discount factor for Bellman expectation calculation.
-            depth: Default search depth (0 for greedy, 1 for 1-ply, 2 for 2-ply expectimax).
+            depth: Default search depth (0 for greedy, 1 for 1-ply, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply).
             max_empty_samples: Optional maximum number of empty cells to sample per chance node.
                 None evaluates all empty cells deterministically.
             use_d4_symmetry: Whether to enable 8-fold Dihedral D4 symmetry ensembling.
+            tt_max_size: Maximum entries in the Transposition Table before pruning.
         """
         self.model = model
         self.device = device or get_device(prefer_gpu=True)
@@ -103,11 +113,17 @@ class ExpectimaxSearcher:
         self.depth = depth
         self.max_empty_samples = max_empty_samples
         self.use_d4_symmetry = use_d4_symmetry
+        self.tt_max_size = tt_max_size
+        self.tt: Dict[int, float] = {}
         self.core = Game2048Core()
+
+    def clear_tt(self) -> None:
+        """Clear all cached entries in the Transposition Table."""
+        self.tt.clear()
 
     def select_action(
         self,
-        board: np.ndarray,
+        board: Union[np.ndarray, int],
         action_mask: Optional[np.ndarray] = None,
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
@@ -115,7 +131,7 @@ class ExpectimaxSearcher:
         """Select best action using lookahead search.
 
         Args:
-            board: Current 4x4 integer game board.
+            board: Current 4x4 integer game board or 64-bit bitboard int.
             action_mask: Optional boolean array of legal actions.
             depth: Optional search depth overriding instance default.
             use_d4_symmetry: Optional D4 symmetry toggle overriding instance default.
@@ -133,7 +149,7 @@ class ExpectimaxSearcher:
 
     def search(
         self,
-        board: np.ndarray,
+        board: Union[np.ndarray, int],
         action_mask: Optional[np.ndarray] = None,
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
@@ -141,9 +157,9 @@ class ExpectimaxSearcher:
         """Perform Expectimax search from current board state.
 
         Args:
-            board: 4x4 integer numpy array.
-            action_mask: Optional boolean array of shape (4,). If None, calculated via core.
-            depth: Search depth (0, 1, 2, or 3). Defaults to self.depth.
+            board: 4x4 integer numpy array or 64-bit bitboard integer.
+            action_mask: Optional boolean array of shape (4,). If None, calculated via bitboard/core.
+            depth: Search depth (0, 1, 2, 3, or 4). Defaults to self.depth.
             use_d4_symmetry: Optional D4 toggle overriding instance setting.
 
         Returns:
@@ -152,8 +168,20 @@ class ExpectimaxSearcher:
         d = self.depth if depth is None else depth
         d4_active = self.use_d4_symmetry if use_d4_symmetry is None else use_d4_symmetry
 
+        # Prune cache between moves if maximum capacity is exceeded
+        if len(self.tt) > self.tt_max_size:
+            self.tt.clear()
+
+        # Convert to bitboard if numpy array
+        if isinstance(board, np.ndarray):
+            bb = Bitboard2048.from_array(board)
+            np_board = board
+        else:
+            bb = int(board)
+            np_board = None
+
         if action_mask is None:
-            mask = self.core.get_action_mask(board)
+            mask = Bitboard2048.get_action_mask(bb)
         else:
             mask = np.asarray(action_mask, dtype=bool)
 
@@ -167,15 +195,37 @@ class ExpectimaxSearcher:
             return only_act, {a: (0.0 if a == only_act else -1e9) for a in range(4)}
 
         if d <= 0:
-            return self._search_greedy(board, mask, use_d4=d4_active)
+            if np_board is None:
+                np_board = Bitboard2048.to_array(bb)
+            return self._search_greedy(np_board, mask, use_d4=d4_active)
         elif d == 1:
-            return self._search_depth_1(board, legal_actions, use_d4=d4_active)
+            return self._search_depth_1(bb, legal_actions, use_d4=d4_active)
         elif d == 2:
-            return self._search_depth_2(board, legal_actions, use_d4=d4_active)
+            return self._search_depth_2(bb, legal_actions, use_d4=d4_active)
         elif d == 3:
-            return self._search_depth_3(board, legal_actions, use_d4=d4_active)
+            return self._search_depth_3(bb, legal_actions, use_d4=d4_active)
+        elif d >= 4:
+            return self._search_depth_4(bb, legal_actions, use_d4=d4_active)
         else:
-            return self._search_depth_2(board, legal_actions, use_d4=d4_active)
+            return self._search_depth_2(bb, legal_actions, use_d4=d4_active)
+
+    def _ensure_evaluated(self, bitboards: Iterable[int], use_d4: bool) -> None:
+        """Evaluate un-cached canonical bitboards in a single batched GPU forward pass."""
+        unrated: Dict[int, int] = {}
+        for b in bitboards:
+            canon = Bitboard2048.get_canonical(int(b))
+            if canon not in self.tt and canon not in unrated:
+                unrated[canon] = int(b)
+
+        if not unrated:
+            return
+
+        canon_keys = list(unrated.keys())
+        rep_boards = list(unrated.values())
+        v_vals = self._batch_evaluate_boards(rep_boards, use_d4=use_d4)
+
+        for k, v in zip(canon_keys, v_vals):
+            self.tt[k] = float(v)
 
     def _search_greedy(
         self,
@@ -199,8 +249,6 @@ class ExpectimaxSearcher:
                     batch_masks = generate_d4_masks(mask_t)
                     q_vals_d4 = self.model(batch_d4, action_mask=batch_masks)  # (8, 4)
 
-                    # Reverse map actions for each orientation k:
-                    # transformed action j corresponds to original action perm[j]
                     q_orig_accum = torch.zeros(4, device=self.device)
                     for k, perm in enumerate(_D4_ACTION_PERMUTATIONS):
                         for j in range(4):
@@ -220,29 +268,30 @@ class ExpectimaxSearcher:
 
     def _search_depth_1(
         self,
-        board: np.ndarray,
-        legal_actions: np.ndarray,
+        bb: int,
+        legal_actions: Sequence[int],
         use_d4: bool = False,
     ) -> Tuple[int, Dict[int, float]]:
         """1-ply lookahead: evaluate afterstate for each legal action."""
-        after_boards = []
-        imm_rewards = []
-        valid_actions = []
+        after_boards: List[int] = []
+        imm_rewards: List[float] = []
+        valid_actions: List[int] = []
 
         for a in legal_actions:
-            next_b, _, lr, changed = Game2048Core._execute_slide(board, a)
+            nb, _, lr, changed = Bitboard2048.move(bb, a)
             if changed:
-                after_boards.append(next_b)
+                after_boards.append(nb)
                 imm_rewards.append(lr)
                 valid_actions.append(a)
 
         if len(after_boards) == 0:
             return int(legal_actions[0]), {a: -1e9 for a in range(4)}
 
-        v_vals = self._batch_evaluate_boards(after_boards, use_d4=use_d4)
+        self._ensure_evaluated(after_boards, use_d4=use_d4)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
-        for a, lr, v in zip(valid_actions, imm_rewards, v_vals):
+        for a, lr, nb in zip(valid_actions, imm_rewards, after_boards):
+            v = self.tt.get(Bitboard2048.get_canonical(nb), 0.0)
             q_dict[a] = lr + self.gamma * v
 
         best_action = max(valid_actions, key=lambda a: q_dict[a])
@@ -250,164 +299,287 @@ class ExpectimaxSearcher:
 
     def _search_depth_2(
         self,
-        board: np.ndarray,
-        legal_actions: np.ndarray,
+        bb: int,
+        legal_actions: Sequence[int],
         use_d4: bool = False,
     ) -> Tuple[int, Dict[int, float]]:
-        """2-ply Expectimax: simulate move -> tile spawns 2/4 -> batched leaf evaluation.
+        """2-ply Expectimax: action slide -> chance spawns 2/4 -> batched leaf evaluation.
 
         For each legal action:
-            1. Simulates deterministic slide-and-merge yielding s_after and immediate reward r.
-            2. Branches over all empty cells with nature spawn probabilities (90% for 2, 10% for 4).
-            3. Evaluates all resulting leaf states in a single batched GPU forward pass (optionally D4 symmetrized).
-            4. Calculates expected return: Q(s, a) = r + gamma * sum(P(spawn) * max_{a'} Q(s', a')).
+            1. Deterministic slide-and-merge yields s_after and immediate reward r.
+            2. Branches over all empty cells with spawn probabilities (90% for 2, 10% for 4).
+            3. Evaluates all unique un-cached leaf states via Transposition Table and batched GPU pass.
+            4. Returns action maximizing Q(s, a) = r + gamma * sum(P(spawn) * V(s')).
         """
-        all_children: List[np.ndarray] = []
-        all_weights: List[float] = []
-        all_action_owners: List[int] = []
-        action_immediate_rewards: Dict[int, float] = {}
+        all_leaves: List[int] = []
+        tree: Dict[int, Tuple[float, List[Tuple[float, int]]]] = {}
 
         for a in legal_actions:
-            next_b, _, lr, changed = Game2048Core._execute_slide(board, a)
+            nb, _, lr, changed = Bitboard2048.move(bb, a)
             if not changed:
                 continue
 
-            action_immediate_rewards[a] = lr
-            empty_cells = np.flatnonzero(next_b == 0)
-            num_empty = len(empty_cells)
+            empty = Bitboard2048.get_empty_cells(nb)
+            num_empty = len(empty)
 
             if num_empty == 0:
-                all_children.append(next_b.copy())
-                all_weights.append(1.0)
-                all_action_owners.append(a)
+                tree[a] = (lr, [(1.0, nb)])
+                all_leaves.append(nb)
             else:
                 if (
                     self.max_empty_samples is not None
                     and num_empty > self.max_empty_samples
                 ):
-                    sampled_cells = np.random.choice(
-                        empty_cells, self.max_empty_samples, replace=False
+                    sampled = np.random.choice(
+                        empty, self.max_empty_samples, replace=False
                     )
                 else:
-                    sampled_cells = empty_cells
+                    sampled = empty
 
-                w_base = 1.0 / len(sampled_cells)
-                for cell_idx in sampled_cells:
-                    # Spawn 2 with 90% probability
-                    b2 = next_b.copy()
-                    b2.flat[cell_idx] = 2
-                    all_children.append(b2)
-                    all_weights.append(0.90 * w_base)
-                    all_action_owners.append(a)
+                w_base = 1.0 / len(sampled)
+                branches: List[Tuple[float, int]] = []
+                for c in sampled:
+                    b2 = Bitboard2048.spawn_tile_at(nb, c, 2)
+                    branches.append((0.90 * w_base, b2))
+                    all_leaves.append(b2)
 
-                    # Spawn 4 with 10% probability
-                    b4 = next_b.copy()
-                    b4.flat[cell_idx] = 4
-                    all_children.append(b4)
-                    all_weights.append(0.10 * w_base)
-                    all_action_owners.append(a)
+                    b4 = Bitboard2048.spawn_tile_at(nb, c, 4)
+                    branches.append((0.10 * w_base, b4))
+                    all_leaves.append(b4)
 
-        if len(all_children) == 0:
+                tree[a] = (lr, branches)
+
+        if not tree:
             return int(legal_actions[0]), {a: -1e9 for a in range(4)}
 
-        v_vals = self._batch_evaluate_boards(all_children, use_d4=use_d4)
-
-        action_exp_v: Dict[int, float] = {a: 0.0 for a in action_immediate_rewards}
-        for v, w, a in zip(v_vals, all_weights, all_action_owners):
-            action_exp_v[a] += w * v
+        self._ensure_evaluated(all_leaves, use_d4=use_d4)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
-        for a, lr in action_immediate_rewards.items():
-            q_dict[a] = lr + self.gamma * action_exp_v[a]
+        for a, (lr, branches) in tree.items():
+            exp_v = sum(w * self.tt.get(Bitboard2048.get_canonical(b), 0.0) for w, b in branches)
+            q_dict[a] = lr + self.gamma * exp_v
 
-        best_action = max(action_immediate_rewards.keys(), key=lambda a: q_dict[a])
+        best_action = max(tree.keys(), key=lambda a: q_dict[a])
         return int(best_action), q_dict
 
     def _search_depth_3(
         self,
-        board: np.ndarray,
-        legal_actions: np.ndarray,
+        bb: int,
+        legal_actions: Sequence[int],
         use_d4: bool = False,
     ) -> Tuple[int, Dict[int, float]]:
-        """3-ply Expectimax: Action -> Chance Spawn -> Next Action -> Leaf Evaluation."""
-        all_leaves: List[np.ndarray] = []
-        leaf_metadata: List[Tuple[int, float, float]] = []
-        action_immediate_rewards: Dict[int, float] = {}
+        """3-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Leaf Evaluation.
+
+        Backpropagates:
+            V(s_chance) = max_{a2} [ r2 + gamma * V(s_after2) ]
+            Q(s, a1) = r1 + gamma * sum(P(spawn) * V(s_chance))
+        """
+        all_leaves: List[int] = []
+        # tree structure: a1 -> (r1, list of (w_chance, list of (r2, s_after2)))
+        tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]] = {}
 
         max_chance = (
-            4 if self.max_empty_samples is None else min(4, self.max_empty_samples)
+            6 if self.max_empty_samples is None else min(6, self.max_empty_samples)
         )
 
         for a1 in legal_actions:
-            nb1, _, lr1, ch1 = Game2048Core._execute_slide(board, a1)
-            if not ch1:
+            nb1, _, lr1, changed1 = Bitboard2048.move(bb, a1)
+            if not changed1:
                 continue
 
-            action_immediate_rewards[a1] = lr1
-            empty_cells = np.flatnonzero(nb1 == 0)
-            num_empty = len(empty_cells)
+            empty = Bitboard2048.get_empty_cells(nb1)
+            num_empty = len(empty)
 
             if num_empty == 0:
-                all_leaves.append(nb1.copy())
-                leaf_metadata.append((a1, 1.0, 0.0))
+                # Terminal or full board after slide
+                tree[a1] = (lr1, [(1.0, [(0.0, nb1)])])
+                all_leaves.append(nb1)
                 continue
 
             if num_empty > max_chance:
-                sampled_cells = np.random.choice(
-                    empty_cells, max_chance, replace=False
-                )
+                sampled = np.random.choice(empty, max_chance, replace=False)
             else:
-                sampled_cells = empty_cells
+                sampled = empty
 
-            w_base = 1.0 / len(sampled_cells)
+            w_base = 1.0 / len(sampled)
+            chance_branches: List[Tuple[float, List[Tuple[float, int]]]] = []
 
-            for cell_idx in sampled_cells:
+            for c in sampled:
                 for val, p_val in [(2, 0.90), (4, 0.10)]:
-                    s_chance = nb1.copy()
-                    s_chance.flat[cell_idx] = val
-                    chance_w = p_val * w_base
+                    s_chance = Bitboard2048.spawn_tile_at(nb1, c, val)
+                    w_chance = p_val * w_base
 
-                    mask2 = self.core.get_action_mask(s_chance)
+                    # Legal actions from s_chance
+                    mask2 = Bitboard2048.get_action_mask(s_chance)
                     legal2 = np.flatnonzero(mask2)
 
                     if len(legal2) == 0:
-                        all_leaves.append(s_chance)
-                        leaf_metadata.append((a1, chance_w, 0.0))
+                        # Terminal chance outcome: value 0.0
+                        chance_branches.append((w_chance, []))
                     else:
+                        act2_moves: List[Tuple[float, int]] = []
                         for a2 in legal2:
-                            nb2, _, lr2, ch2 = Game2048Core._execute_slide(
-                                s_chance, a2
-                            )
+                            nb2, _, lr2, ch2 = Bitboard2048.move(s_chance, a2)
                             if ch2:
+                                act2_moves.append((lr2, nb2))
                                 all_leaves.append(nb2)
-                                leaf_metadata.append((a1, chance_w, lr2))
+                        chance_branches.append((w_chance, act2_moves))
 
-        if len(all_leaves) == 0:
-            return self._search_depth_2(board, legal_actions, use_d4=use_d4)
+            tree[a1] = (lr1, chance_branches)
 
-        leaf_v = self._batch_evaluate_boards(all_leaves, use_d4=use_d4)
+        if not tree:
+            return self._search_depth_2(bb, legal_actions, use_d4=use_d4)
 
-        action_exp_v: Dict[int, float] = {a: 0.0 for a in action_immediate_rewards}
-        for v, (a1, chance_w, lr2) in zip(leaf_v, leaf_metadata):
-            q_ply2 = lr2 + self.gamma * v
-            action_exp_v[a1] += chance_w * q_ply2
+        self._ensure_evaluated(all_leaves, use_d4=use_d4)
 
         q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
-        for a, lr in action_immediate_rewards.items():
-            q_dict[a] = lr + self.gamma * action_exp_v[a]
+        for a1, (lr1, chance_branches) in tree.items():
+            exp_v = 0.0
+            for w_chance, act2_moves in chance_branches:
+                if not act2_moves:
+                    best_q2 = 0.0
+                else:
+                    best_q2 = max(
+                        lr2 + self.gamma * self.tt.get(Bitboard2048.get_canonical(nb2), 0.0)
+                        for lr2, nb2 in act2_moves
+                    )
+                exp_v += w_chance * best_q2
+            q_dict[a1] = lr1 + self.gamma * exp_v
 
-        best_action = max(action_immediate_rewards.keys(), key=lambda a: q_dict[a])
+        best_action = max(tree.keys(), key=lambda a: q_dict[a])
+        return int(best_action), q_dict
+
+    def _search_depth_4(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+        use_d4: bool = False,
+    ) -> Tuple[int, Dict[int, float]]:
+        """4-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Leaf Evaluation.
+
+        Applies probability pruning (pruning branches with p < 0.001) and beam search.
+        """
+        all_leaves: List[int] = []
+        # tree: a1 -> (lr1, list of (w_chance1, list of (lr2, list of (w_chance2, s_leaf))))
+        tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]] = {}
+
+        max_chance1 = (
+            4 if self.max_empty_samples is None else min(4, self.max_empty_samples)
+        )
+        max_chance2 = 4
+
+        for a1 in legal_actions:
+            nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
+            if not ch1:
+                continue
+
+            empty1 = Bitboard2048.get_empty_cells(nb1)
+            num_empty1 = len(empty1)
+            if num_empty1 == 0:
+                tree[a1] = (lr1, [(1.0, [(0.0, [(1.0, nb1)])])])
+                all_leaves.append(nb1)
+                continue
+
+            sampled1 = (
+                np.random.choice(empty1, max_chance1, replace=False)
+                if num_empty1 > max_chance1
+                else empty1
+            )
+            w_base1 = 1.0 / len(sampled1)
+            chance1_branches = []
+
+            for c1 in sampled1:
+                for val1, p1 in [(2, 0.90), (4, 0.10)]:
+                    s1 = Bitboard2048.spawn_tile_at(nb1, c1, val1)
+                    w1 = p1 * w_base1
+
+                    mask2 = Bitboard2048.get_action_mask(s1)
+                    legal2 = np.flatnonzero(mask2)
+                    if len(legal2) == 0:
+                        chance1_branches.append((w1, []))
+                        continue
+
+                    act2_branches = []
+                    for a2 in legal2:
+                        nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
+                        if not ch2:
+                            continue
+
+                        empty2 = Bitboard2048.get_empty_cells(nb2)
+                        num_empty2 = len(empty2)
+                        if num_empty2 == 0:
+                            act2_branches.append((lr2, [(1.0, nb2)]))
+                            all_leaves.append(nb2)
+                            continue
+
+                        sampled2 = (
+                            np.random.choice(empty2, max_chance2, replace=False)
+                            if num_empty2 > max_chance2
+                            else empty2
+                        )
+                        w_base2 = 1.0 / len(sampled2)
+                        chance2_branches = []
+
+                        for c2 in sampled2:
+                            for val2, p2 in [(2, 0.90), (4, 0.10)]:
+                                p_branch = w1 * (p2 * w_base2)
+                                # Probability pruning: skip branches with negligible cumulative probability
+                                if p_branch < 0.001 and val2 == 4:
+                                    continue
+
+                                s2 = Bitboard2048.spawn_tile_at(nb2, c2, val2)
+                                w2 = p2 * w_base2
+                                chance2_branches.append((w2, s2))
+                                all_leaves.append(s2)
+
+                        if chance2_branches:
+                            act2_branches.append((lr2, chance2_branches))
+
+                    chance1_branches.append((w1, act2_branches))
+
+            tree[a1] = (lr1, chance1_branches)
+
+        if not tree:
+            return self._search_depth_3(bb, legal_actions, use_d4=use_d4)
+
+        self._ensure_evaluated(all_leaves, use_d4=use_d4)
+
+        q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
+        for a1, (lr1, chance1_branches) in tree.items():
+            exp_v1 = 0.0
+            for w1, act2_branches in chance1_branches:
+                if not act2_branches:
+                    best_q2 = 0.0
+                else:
+                    best_q2 = -1e9
+                    for lr2, chance2_branches in act2_branches:
+                        if not chance2_branches:
+                            q2 = lr2
+                        else:
+                            exp_v2 = sum(
+                                w2 * self.tt.get(Bitboard2048.get_canonical(s2), 0.0)
+                                for w2, s2 in chance2_branches
+                            )
+                            q2 = lr2 + self.gamma * exp_v2
+                        if q2 > best_q2:
+                            best_q2 = q2
+                    if best_q2 == -1e9:
+                        best_q2 = 0.0
+                exp_v1 += w1 * best_q2
+            q_dict[a1] = lr1 + self.gamma * exp_v1
+
+        best_action = max(tree.keys(), key=lambda a: q_dict[a])
         return int(best_action), q_dict
 
     def _batch_evaluate_boards(
         self,
-        boards: List[np.ndarray],
+        boards: Sequence[Union[np.ndarray, int]],
         use_d4: Optional[bool] = None,
     ) -> np.ndarray:
         """Evaluate a collection of boards in a single GPU forward pass with optional D4 symmetrization.
 
         Args:
-            boards: List of 4x4 integer boards.
+            boards: Sequence of 4x4 integer boards or 64-bit bitboard integers.
             use_d4: Optional toggle overriding instance setting.
 
         Returns:
@@ -419,16 +591,30 @@ class ExpectimaxSearcher:
 
         d4_active = self.use_d4_symmetry if use_d4 is None else use_d4
 
-        boards_arr = np.stack(boards)
-        clipped = np.clip(boards_arr, 0, MAX_TILE_VAL)
-        exps = _POWER_LUT[clipped].astype(np.uint8)
+        first = boards[0]
+        if isinstance(first, (int, np.integer)):
+            # Fast vectorized bitboard to uint8 exponent conversion
+            bbs = np.fromiter(boards, dtype=np.uint64, count=n)
+            exps = ((bbs[:, None] >> _SHIFTS_64) & np.uint64(0xF)).astype(np.uint8).reshape(n, 4, 4)
+
+            # Compute legal action masks for all child bitboards
+            masks_np = np.zeros((n, 4), dtype=bool)
+            for i, b in enumerate(boards):
+                bb_int = int(b)
+                masks_np[i, 0] = Bitboard2048.is_move_legal(bb_int, Action.LEFT)
+                masks_np[i, 1] = Bitboard2048.is_move_legal(bb_int, Action.RIGHT)
+                masks_np[i, 2] = Bitboard2048.is_move_legal(bb_int, Action.UP)
+                masks_np[i, 3] = Bitboard2048.is_move_legal(bb_int, Action.DOWN)
+        else:
+            boards_arr = np.stack(boards)
+            clipped = np.clip(boards_arr, 0, MAX_TILE_VAL)
+            exps = _POWER_LUT[clipped].astype(np.uint8)
+            masks_np = np.stack([self.core.get_action_mask(b) for b in boards])
 
         # Non-blocking transfer of compact uint8 representation to GPU
         exps_t = torch.from_numpy(exps).to(self.device, non_blocking=True)
         obs_t = F.one_hot(exps_t.long(), 16).permute(0, 3, 1, 2).float()
 
-        # Compute legal action masks for all child boards
-        masks_np = np.stack([self.core.get_action_mask(b) for b in boards])
         masks_t = torch.from_numpy(masks_np).bool().to(self.device, non_blocking=True)
         has_legal = masks_t.any(dim=-1)
 
@@ -460,7 +646,7 @@ class ExpectimaxSearcher:
 
 
 def expectimax_search(
-    board: np.ndarray,
+    board: Union[np.ndarray, int],
     model: nn.Module,
     device: Optional[torch.device] = None,
     depth: int = 2,
@@ -478,4 +664,3 @@ def expectimax_search(
         use_d4_symmetry=use_d4_symmetry,
     )
     return searcher.search(board, depth=depth, use_d4_symmetry=use_d4_symmetry)
-

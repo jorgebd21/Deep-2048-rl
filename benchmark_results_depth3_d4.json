@@ -1,0 +1,22 @@
+{
+  "num_episodes": 30,
+  "lookahead_depth": 3,
+  "use_d4_symmetry": true,
+  "elapsed_seconds": 583.04,
+  "mean_score": 45201.73333333333,
+  "std_score": 16483.12331837898,
+  "median_score": 36736.0,
+  "min_score": 16364.0,
+  "max_score": 78808.0,
+  "mean_steps": 2184.6,
+  "reach_256_rate": 1.0,
+  "reach_512_rate": 1.0,
+  "reach_1024_rate": 1.0,
+  "reach_2048_rate": 0.9666666666666667,
+  "reach_4096_rate": 0.4,
+  "tile_distribution": {
+    "1024": 1,
+    "2048": 17,
+    "4096": 12
+  }
+}
