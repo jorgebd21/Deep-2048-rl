@@ -28,6 +28,9 @@ class TrainingConfig:
     checkpoint_dir: str = "checkpoints"
     save_latest_freq: int = 100
     seed: Optional[int] = 42
+    enable_tensorboard: bool = True
+    log_dir: Optional[str] = None
+    pin_memory: bool = True
 
 
 class Trainer:
@@ -47,6 +50,10 @@ class Trainer:
         self.buffer = buffer or PrioritizedReplayBuffer(capacity=self.config.buffer_capacity)
 
         self.best_eval_score = 0.0
+        self.total_env_steps = 0
+        self.total_opt_steps = 0
+        self.start_time = time.time()
+
         self.history: Dict[str, List[float]] = {
             "episode_scores": [],
             "episode_max_tiles": [],
@@ -57,6 +64,18 @@ class Trainer:
         }
 
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+
+        # TensorBoard Telemetry
+        self.writer = None
+        if self.config.enable_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                log_dir = self.config.log_dir or os.path.join(
+                    "runs", f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+                )
+                self.writer = SummaryWriter(log_dir=log_dir)
+            except ImportError:
+                self.writer = None
 
     def warmup(self) -> None:
         """Populate experience buffer with uniform random legal transitions."""
@@ -98,7 +117,7 @@ class Trainer:
             num_episodes: Number of evaluation episodes; defaults to config.eval_episodes.
 
         Returns:
-            Dictionary containing mean score, highest tile observed, and mean steps.
+            Dictionary containing evaluation summary metrics.
         """
         n_eps = num_episodes or self.config.eval_episodes
         eval_scores = []
@@ -124,19 +143,39 @@ class Trainer:
             eval_max_tiles.append(float(info["max_tile"]))
             eval_lengths.append(float(ep_steps))
 
-        return {
+        max_tiles_np = np.array(eval_max_tiles)
+        metrics = {
             "mean_score": float(np.mean(eval_scores)),
             "max_tile": float(np.max(eval_max_tiles)),
             "mean_steps": float(np.mean(eval_lengths)),
+            "reach_512_rate": float(np.mean(max_tiles_np >= 512)),
+            "reach_1024_rate": float(np.mean(max_tiles_np >= 1024)),
+            "reach_2048_rate": float(np.mean(max_tiles_np >= 2048)),
         }
+
+        if self.writer is not None:
+            step = self.agent.total_steps
+            self.writer.add_scalar("eval/mean_score", metrics["mean_score"], step)
+            self.writer.add_scalar("eval/max_tile", metrics["max_tile"], step)
+            self.writer.add_scalar("eval/mean_steps", metrics["mean_steps"], step)
+            self.writer.add_scalar("eval/reach_512_rate", metrics["reach_512_rate"], step)
+            self.writer.add_scalar("eval/reach_1024_rate", metrics["reach_1024_rate"], step)
+            self.writer.add_scalar("eval/reach_2048_rate", metrics["reach_2048_rate"], step)
+
+        return metrics
 
     def train_step(self) -> Optional[float]:
         """Sample mini-batch from buffer, optimize policy, and update target network."""
         if len(self.buffer) < self.config.batch_size:
             return None
 
-        batch = self.buffer.sample(self.config.batch_size, device=self.agent.device)
+        batch = self.buffer.sample(
+            self.config.batch_size,
+            device=self.agent.device,
+            pin_memory=self.config.pin_memory,
+        )
         loss, td_errors = self.agent.update(batch)
+        self.total_opt_steps += 1
 
         # Update PER tree priorities
         self.buffer.update_priorities(batch["indices"], td_errors)
@@ -146,6 +185,15 @@ class Trainer:
             self.agent.update_target_soft(self.config.tau)
         elif self.agent.total_steps % self.config.target_update_freq == 0:
             self.agent.update_target_hard()
+
+        # Telemetry logging per gradient update
+        if self.writer is not None and self.total_opt_steps % 10 == 0:
+            agent_metrics = self.agent.get_last_metrics()
+            step = self.agent.total_steps
+            self.writer.add_scalar("train/loss", loss, step)
+            self.writer.add_scalar("train/mean_td_error", agent_metrics["mean_td_error"], step)
+            self.writer.add_scalar("train/mean_q", agent_metrics["mean_q"], step)
+            self.writer.add_scalar("train/epsilon", self.agent.epsilon, step)
 
         return loss
 
@@ -160,6 +208,7 @@ class Trainer:
         """
         total_episodes = max_episodes or self.config.total_episodes
         self.warmup()
+        self.start_time = time.time()
 
         for ep in range(1, total_episodes + 1):
             obs, info = self.env.reset()
@@ -177,6 +226,7 @@ class Trainer:
 
                 next_obs, reward, terminated, truncated, next_info = self.env.step(action)
                 done = terminated or truncated
+                self.total_env_steps += 1
 
                 # Store transition
                 self.buffer.add(
@@ -202,11 +252,29 @@ class Trainer:
                 ep_steps += 1
 
             # Episode logging
-            self.history["episode_scores"].append(float(info["score"]))
-            self.history["episode_max_tiles"].append(float(info["max_tile"]))
+            score = float(info["score"])
+            max_tile = float(info["max_tile"])
+            self.history["episode_scores"].append(score)
+            self.history["episode_max_tiles"].append(max_tile)
             self.history["episode_lengths"].append(float(ep_steps))
             if ep_losses:
                 self.history["losses"].append(float(np.mean(ep_losses)))
+
+            # Tensorboard Episode Logging
+            if self.writer is not None:
+                step = self.agent.total_steps
+                elapsed = max(1e-5, time.time() - self.start_time)
+                env_sps = self.total_env_steps / elapsed
+                samples_sps = (self.total_opt_steps * self.config.batch_size) / elapsed
+
+                self.writer.add_scalar("episode/score", score, step)
+                self.writer.add_scalar("episode/steps", ep_steps, step)
+                self.writer.add_scalar("episode/max_tile", max_tile, step)
+                self.writer.add_scalar("episode/reach_512", 1.0 if max_tile >= 512 else 0.0, step)
+                self.writer.add_scalar("episode/reach_1024", 1.0 if max_tile >= 1024 else 0.0, step)
+                self.writer.add_scalar("episode/reach_2048", 1.0 if max_tile >= 2048 else 0.0, step)
+                self.writer.add_scalar("throughput/env_steps_per_sec", env_sps, step)
+                self.writer.add_scalar("throughput/samples_per_sec", samples_sps, step)
 
             # Periodic Evaluation
             if ep % self.config.eval_freq == 0:
@@ -224,6 +292,9 @@ class Trainer:
                             "episode": ep,
                             "eval_mean_score": self.best_eval_score,
                             "eval_max_tile": eval_metrics["max_tile"],
+                            "reach_512_rate": eval_metrics["reach_512_rate"],
+                            "reach_1024_rate": eval_metrics["reach_1024_rate"],
+                            "reach_2048_rate": eval_metrics["reach_2048_rate"],
                         },
                     )
 
@@ -234,5 +305,9 @@ class Trainer:
                     latest_path,
                     metadata={"episode": ep, "steps": self.agent.total_steps},
                 )
+
+        if self.writer is not None:
+            self.writer.flush()
+            self.writer.close()
 
         return self.history

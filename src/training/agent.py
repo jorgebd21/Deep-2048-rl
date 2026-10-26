@@ -46,6 +46,11 @@ class DDQNAgent:
         self.epsilon_min = epsilon_min
         self.epsilon_decay_steps = epsilon_decay_steps
         self.total_steps = 0
+        self.last_metrics: Dict[str, float] = {
+            "loss": 0.0,
+            "mean_td_error": 0.0,
+            "mean_q": 0.0,
+        }
 
         # Online policy network and target network
         self.policy_net = Dueling2048Net(
@@ -167,6 +172,10 @@ class DDQNAgent:
         elementwise_loss = F.smooth_l1_loss(current_q, target_q, reduction="none", beta=1.0)
         weighted_loss = (elementwise_loss * weights).mean()
 
+        # Cache metrics for telemetry
+        self.last_metrics["mean_q"] = float(current_q.detach().mean().item())
+        self.last_metrics["mean_td_error"] = float(td_errors.detach().mean().item())
+
         return weighted_loss, td_errors
 
     def update(self, batch: Dict[str, torch.Tensor]) -> Tuple[float, np.ndarray]:
@@ -192,7 +201,14 @@ class DDQNAgent:
         )
         self.optimizer.step()
 
-        return loss.item(), td_errors.detach().cpu().numpy()
+        loss_val = float(loss.item())
+        self.last_metrics["loss"] = loss_val
+
+        return loss_val, td_errors.detach().cpu().numpy()
+
+    def get_last_metrics(self) -> Dict[str, float]:
+        """Return the most recent optimization metrics dictionary."""
+        return self.last_metrics.copy()
 
     def update_target_hard(self) -> None:
         """Copy weights directly from policy network to target network."""
