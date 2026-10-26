@@ -79,7 +79,12 @@ class Trainer:
             "eval_max_tiles": [],
         }
 
-        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        # Defensive checkpoint directory handling
+        ckpt_dir = self.config.checkpoint_dir
+        if os.path.isfile(ckpt_dir):
+            ckpt_dir = os.path.dirname(ckpt_dir) or "checkpoints"
+            self.config.checkpoint_dir = ckpt_dir
+        os.makedirs(ckpt_dir, exist_ok=True)
 
         # TensorBoard Telemetry
         self.writer = None

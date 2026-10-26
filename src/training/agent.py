@@ -300,12 +300,53 @@ class DDQNAgent:
         }
         torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path: str) -> Dict[str, Any]:
-        """Load network parameters, optimizer state, and training metadata."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint["policy_net_state_dict"])
-        self.target_net.load_state_dict(checkpoint["target_net_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.epsilon = checkpoint.get("epsilon", self.epsilon_min)
-        self.total_steps = checkpoint.get("total_steps", 0)
-        return checkpoint.get("metadata", {})
+    def load_checkpoint(
+        self, path: str, resume_epsilon: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Load network parameters, optimizer state, and training metadata.
+
+        Args:
+            path: Path to checkpoint file.
+            resume_epsilon: Optional epsilon to override for fine-tuning exploration.
+
+        Returns:
+            Checkpoint metadata dictionary.
+        """
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        metadata = {}
+
+        if isinstance(checkpoint, dict):
+            if "policy_net_state_dict" in checkpoint:
+                self.policy_net.load_state_dict(checkpoint["policy_net_state_dict"])
+            elif "model_state_dict" in checkpoint:
+                self.policy_net.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                self.policy_net.load_state_dict(checkpoint)
+
+            if "target_net_state_dict" in checkpoint:
+                self.target_net.load_state_dict(checkpoint["target_net_state_dict"])
+            else:
+                self.update_target_hard()
+
+            if "optimizer_state_dict" in checkpoint:
+                try:
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                except Exception:
+                    pass
+
+            self.total_steps = checkpoint.get("total_steps", 0)
+            if resume_epsilon is not None:
+                self.epsilon = float(resume_epsilon)
+                self.epsilon_start = float(resume_epsilon)
+            else:
+                self.epsilon = checkpoint.get("epsilon", self.epsilon_min)
+
+            metadata = checkpoint.get("metadata", {})
+        else:
+            self.policy_net.load_state_dict(checkpoint)
+            self.update_target_hard()
+            if resume_epsilon is not None:
+                self.epsilon = float(resume_epsilon)
+                self.epsilon_start = float(resume_epsilon)
+
+        return metadata

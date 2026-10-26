@@ -15,13 +15,15 @@ from src.env.vectorized import VectorizedGame2048Env
 from src.memory.replay_buffer import PrioritizedReplayBuffer
 from src.training.agent import DDQNAgent
 from src.training.trainer import Trainer, TrainingConfig
+from src.utils.checkpoint import resolve_checkpoint_path
 from src.utils.cuda_utils import get_device, get_gpu_telemetry, setup_ampere_tf32
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments for the training pipeline."""
     parser = argparse.ArgumentParser(
-        description="Train Double Dueling Deep Q-Network on 2048 from scratch."
+        description="Train Double Dueling Deep Q-Network on 2048 from scratch or resume.",
+        allow_abbrev=False,
     )
     parser.add_argument("--episodes", type=int, default=2000, help="Total training episodes")
     parser.add_argument("--num-envs", type=int, default=32, help="Number of concurrent vectorized environments")
@@ -35,7 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-freq", type=int, default=1, help="Vectorized steps between gradient updates")
     parser.add_argument("--eval-freq", type=int, default=50, help="Evaluation frequency in episodes")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Episodes per evaluation run")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Save directory")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory where models are saved")
+    parser.add_argument("--resume", "--load-checkpoint", dest="resume", type=str, default=None, help="Path to checkpoint file (.pt) to resume training from")
+    parser.add_argument("--resume-epsilon", type=float, default=0.15, help="Exploration epsilon when resuming (default: 0.15)")
     parser.add_argument("--log-dir", type=str, default=None, help="TensorBoard log directory")
     parser.add_argument("--no-tensorboard", action="store_true", help="Disable TensorBoard")
     parser.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bar")
@@ -58,13 +62,18 @@ def main() -> None:
     gpu_info = get_gpu_telemetry()
     mode_str = "Single Env" if args.single_env else f"Vectorized ({args.num_envs} Parallel Envs)"
 
+    # Defensive checkpoint directory resolution
+    checkpoint_dir = args.checkpoint_dir
+    if os.path.isfile(checkpoint_dir):
+        checkpoint_dir = os.path.dirname(checkpoint_dir) or "checkpoints"
+
     print("\n" + "=" * 65, flush=True)
     print(" DEEP 2048 REINFORCEMENT LEARNING - DDQN TRAINING PIPELINE", flush=True)
     print("=" * 65, flush=True)
     print(f"  Target Device       : {device}", flush=True)
     if gpu_info["device_available"]:
         print(f"  GPU Name            : {gpu_info['device_name']}", flush=True)
-        print(f"  Compute Capability  : {gpu_info['compute_capability']}", flush=True)
+        print(f"  Compute Capability  : {gpu_info['compute_capability']}")
         print(f"  TF32 Enabled        : {torch.backends.cuda.matmul.allow_tf32}", flush=True)
     print(f"  Execution Mode      : {mode_str}", flush=True)
     print(f"  Total Episodes      : {args.episodes}", flush=True)
@@ -72,8 +81,7 @@ def main() -> None:
     print(f"  Learning Rate       : {args.lr}", flush=True)
     print(f"  Discount Factor     : {args.gamma}", flush=True)
     print(f"  PER Capacity        : {args.buffer_capacity}", flush=True)
-    print(f"  Checkpoint Dir      : {args.checkpoint_dir}", flush=True)
-    print("=" * 65 + "\n", flush=True)
+    print(f"  Checkpoint Dir      : {checkpoint_dir}", flush=True)
 
     # Set seeds
     np.random.seed(args.seed)
@@ -92,11 +100,29 @@ def main() -> None:
         tau=args.tau,
         device=device,
     )
+
+    # Resume from checkpoint if requested
+    if args.resume is not None:
+        resume_path = resolve_checkpoint_path(args.resume)
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+
+        meta = agent.load_checkpoint(resume_path, resume_epsilon=args.resume_epsilon)
+        print(f"  Resuming From       : {resume_path}", flush=True)
+        print(f"  Resumed Epsilon     : {agent.epsilon:.2f} (decaying to {agent.epsilon_min})", flush=True)
+        if meta:
+            prev_ep = meta.get("episode", "N/A")
+            prev_score = meta.get("eval_mean_score", "N/A")
+            prev_tile = meta.get("eval_max_tile", "N/A")
+            print(f"  Checkpoint Metadata : Episode {prev_ep} | Score: {prev_score} | Tile: {prev_tile}", flush=True)
+
+    print("=" * 65 + "\n", flush=True)
+
     buffer = PrioritizedReplayBuffer(capacity=args.buffer_capacity)
 
     config = TrainingConfig(
         total_episodes=args.episodes,
-        warmup_steps=args.warmup_steps,
+        warmup_steps=args.warmup_steps if args.resume is None else min(500, args.warmup_steps),
         batch_size=args.batch_size,
         buffer_capacity=args.buffer_capacity,
         num_envs=args.num_envs,
@@ -105,7 +131,7 @@ def main() -> None:
         tau=args.tau,
         eval_freq=args.eval_freq,
         eval_episodes=args.eval_episodes,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=checkpoint_dir,
         log_dir=args.log_dir,
         enable_tensorboard=not args.no_tensorboard,
         use_tqdm=not args.no_tqdm,
