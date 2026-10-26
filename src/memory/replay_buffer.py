@@ -1,6 +1,6 @@
 """Prioritized Experience Replay (PER) buffer with SumTree backing."""
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
@@ -188,16 +188,78 @@ class PrioritizedReplayBuffer:
         if self.tree.size < self.capacity:
             self.tree.size += 1
 
+    def add_batch(
+        self,
+        states: np.ndarray,
+        actions: Union[List[int], np.ndarray],
+        rewards: Union[List[float], np.ndarray],
+        next_states: np.ndarray,
+        dones: Union[List[bool], np.ndarray],
+        action_masks: np.ndarray,
+        next_action_masks: np.ndarray,
+        priorities: Optional[Union[List[float], np.ndarray]] = None,
+    ) -> None:
+        """Append a batch of transitions simultaneously to the circular buffer.
+
+        Args:
+            states: (N, 4, 4) array of tile values or packed exponents.
+            actions: (N,) array of integer actions.
+            rewards: (N,) array of float rewards.
+            next_states: (N, 4, 4) array of boards or exponents.
+            dones: (N,) array of boolean termination flags.
+            action_masks: (N, 4) array of boolean masks.
+            next_action_masks: (N, 4) array of boolean masks.
+            priorities: Optional (N,) array of custom priorities.
+        """
+        n = len(actions)
+        if n == 0:
+            return
+
+        if states.dtype != np.uint8:
+            st = board_to_exponents(states)
+        else:
+            st = states
+
+        if next_states.dtype != np.uint8:
+            nst = board_to_exponents(next_states)
+        else:
+            nst = next_states
+
+        actions_arr = np.asarray(actions, dtype=np.int64)
+        rewards_arr = np.asarray(rewards, dtype=np.float32)
+        dones_arr = np.asarray(dones, dtype=bool)
+
+        for i in range(n):
+            ptr = self.tree.write_ptr
+            tree_idx = ptr + self.capacity - 1
+
+            self.states[ptr] = st[i]
+            self.actions[ptr] = actions_arr[i]
+            self.rewards[ptr] = float(rewards_arr[i])
+            self.next_states[ptr] = nst[i]
+            self.dones[ptr] = bool(dones_arr[i])
+            self.action_masks[ptr] = action_masks[i]
+            self.next_action_masks[ptr] = next_action_masks[i]
+
+            p = self.max_priority if (priorities is None or priorities[i] is None) else float(priorities[i])
+            self.tree.update(tree_idx, p**self.alpha)
+
+            self.tree.write_ptr = (ptr + 1) % self.capacity
+            if self.tree.size < self.capacity:
+                self.tree.size += 1
+
     def sample(
         self,
         batch_size: int,
         device: Optional[torch.device] = None,
+        pin_memory: bool = False,
     ) -> Dict[str, Any]:
         """Sample a prioritized mini-batch with importance sampling correction.
 
         Args:
             batch_size: Number of transitions to sample.
             device: Target torch device (CPU or CUDA).
+            pin_memory: Whether to pin host memory before asynchronous GPU transfer.
 
         Returns:
             Dictionary containing:
@@ -266,6 +328,16 @@ class PrioritizedReplayBuffer:
         weights_t = torch.from_numpy(weights.astype(np.float32)).float()
 
         if device is not None:
+            if device.type == "cuda" and pin_memory:
+                states_t = states_t.pin_memory()
+                actions_t = actions_t.pin_memory()
+                rewards_t = rewards_t.pin_memory()
+                next_states_t = next_states_t.pin_memory()
+                dones_t = dones_t.pin_memory()
+                masks_t = masks_t.pin_memory()
+                next_masks_t = next_masks_t.pin_memory()
+                weights_t = weights_t.pin_memory()
+
             states_t = states_t.to(device, non_blocking=True)
             actions_t = actions_t.to(device, non_blocking=True)
             rewards_t = rewards_t.to(device, non_blocking=True)
