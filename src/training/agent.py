@@ -79,6 +79,7 @@ class DDQNAgent:
         deterministic: bool = False,
         lookahead_depth: int = 0,
         board: Optional[np.ndarray] = None,
+        use_d4_symmetry: bool = False,
     ) -> int:
         """Select an action following epsilon-greedy policy with strict legal masking.
 
@@ -88,6 +89,7 @@ class DDQNAgent:
             deterministic: If True, bypass exploration and choose greedy best action.
             lookahead_depth: Optional search depth (e.g. 2 for 2-ply Expectimax).
             board: Optional 4x4 integer board array required when lookahead_depth > 0.
+            use_d4_symmetry: Whether to enable 8-fold Dihedral D4 symmetry ensembling.
 
         Returns:
             Integer action in {0, 1, 2, 3}.
@@ -106,15 +108,21 @@ class DDQNAgent:
             return int(np.random.choice(valid_actions))
 
         # Lookahead search branch if requested and board provided
-        if lookahead_depth > 0 and board is not None:
+        if (lookahead_depth > 0 or use_d4_symmetry) and board is not None:
             from src.agent.search import ExpectimaxSearcher
             searcher = ExpectimaxSearcher(
                 model=self.policy_net,
                 device=self.device,
                 gamma=self.gamma,
                 depth=lookahead_depth,
+                use_d4_symmetry=use_d4_symmetry,
             )
-            return searcher.select_action(board, action_mask=mask_np, depth=lookahead_depth)
+            return searcher.select_action(
+                board,
+                action_mask=mask_np,
+                depth=lookahead_depth,
+                use_d4_symmetry=use_d4_symmetry,
+            )
 
         # Exploitation branch: greedy action selection through online network
         self.policy_net.eval()

@@ -98,10 +98,11 @@ class Dueling2048Net(nn.Module):
         # Centered aggregation: Q(s, a) = V(s) + (A(s, a) - mean_a'(A(s, a')))
         q_values = v_s + (a_s - a_s.mean(dim=-1, keepdim=True))
 
-        # Additive action masking: illegal actions set to -1e9
+        # Additive action masking: illegal actions set to dtype-safe negative minimum
         if action_mask is not None:
             mask_bool = action_mask.bool()
-            neg_inf = torch.full_like(q_values, -1e9)
+            min_val = -1e4 if q_values.dtype == torch.float16 else -1e9
+            neg_inf = torch.full_like(q_values, min_val)
             q_values = torch.where(mask_bool, q_values, neg_inf)
 
         return q_values

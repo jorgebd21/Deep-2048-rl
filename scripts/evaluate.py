@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply)")
+    parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
     parser.add_argument("--max-empty-samples", type=int, default=None, help="Max empty cells to sample per chance node (default: evaluate all empty cells)")
     parser.add_argument("--save-json", type=str, default=None, help="Save evaluation metrics to JSON file")
     return parser.parse_args()
@@ -40,6 +41,7 @@ def evaluate_agent(
     seed: int = 42,
     lookahead_depth: int = 0,
     max_empty_samples: Optional[int] = None,
+    use_d4_symmetry: bool = False,
 ) -> Dict[str, Any]:
     """Execute deterministic evaluation runs and compute aggregate performance statistics."""
     dev = device or torch.device("cpu")
@@ -47,19 +49,21 @@ def evaluate_agent(
     env = Game2048Env()
 
     searcher: Optional[ExpectimaxSearcher] = None
-    if lookahead_depth > 0:
+    if lookahead_depth > 0 or use_d4_symmetry:
         searcher = ExpectimaxSearcher(
             model=model,
             device=dev,
             depth=lookahead_depth,
             max_empty_samples=max_empty_samples,
+            use_d4_symmetry=use_d4_symmetry,
         )
 
     scores: List[float] = []
     max_tiles: List[int] = []
     steps_list: List[int] = []
 
-    search_mode_str = f"{lookahead_depth}-ply Expectimax search" if lookahead_depth > 0 else "pure greedy (0-ply)"
+    d4_str = " + D4 Symmetry" if use_d4_symmetry else ""
+    search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}" if lookahead_depth > 0 else f"pure greedy (0-ply{d4_str})"
     print(f"\nRunning {episodes} evaluation episodes with {search_mode_str}...")
     start_time = time.time()
 
@@ -108,6 +112,7 @@ def evaluate_agent(
     results = {
         "num_episodes": episodes,
         "lookahead_depth": lookahead_depth,
+        "use_d4_symmetry": use_d4_symmetry,
         "elapsed_seconds": round(elapsed, 2),
         "mean_score": float(np.mean(scores_arr)),
         "std_score": float(np.std(scores_arr)),
@@ -199,6 +204,7 @@ def main() -> None:
         seed=args.seed,
         lookahead_depth=args.lookahead_depth,
         max_empty_samples=args.max_empty_samples,
+        use_d4_symmetry=args.use_d4_symmetry,
     )
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -207,12 +213,14 @@ def main() -> None:
         except Exception:
             pass
 
-    search_label = f"{args.lookahead_depth}-ply Expectimax" if args.lookahead_depth > 0 else "Pure Greedy (0-ply)"
+    d4_label = " + D4 Symmetry" if args.use_d4_symmetry else ""
+    search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}" if args.lookahead_depth > 0 else f"Pure Greedy (0-ply{d4_label})"
     print("\n" + "=" * 65)
     print(f" MONTE CARLO EVALUATION REPORT ({search_label})")
     print("=" * 65)
     print(f"  Episodes Evaluated  : {results['num_episodes']}")
     print(f"  Lookahead Depth     : {results['lookahead_depth']}")
+    print(f"  D4 Symmetrization   : {'Enabled' if results['use_d4_symmetry'] else 'Disabled'}")
     print(f"  Elapsed Time        : {results['elapsed_seconds']:.2f} s")
     print(f"  Mean Score          : {results['mean_score']:.1f} +/- {results['std_score']:.1f}")
     print(f"  Median Score        : {results['median_score']:.1f}")

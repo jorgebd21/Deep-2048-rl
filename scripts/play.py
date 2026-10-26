@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
     parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply)")
+    parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
     return parser.parse_args()
 
 
@@ -112,7 +113,8 @@ def play(args: argparse.Namespace) -> None:
     while not done:
         clear_screen()
         print("\n" + "=" * 52)
-        mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX" if args.lookahead_depth > 0 else "GREEDY"
+        d4_str = " + D4" if args.use_d4_symmetry else ""
+        mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX{d4_str}" if args.lookahead_depth > 0 else f"GREEDY{d4_str}"
         status = f"TRAINED ({mode_str})" if model_loaded else f"UNTRAINED ({mode_str})"
         print(f"  DEEP 2048 RL LIVE AGENT VIEWER ({status})")
         print("=" * 52 + "\n")
@@ -128,10 +130,20 @@ def play(args: argparse.Namespace) -> None:
         if len(valid_actions) == 0:
             break
 
-        if args.lookahead_depth > 0:
+        if args.lookahead_depth > 0 or args.use_d4_symmetry:
             from src.agent.search import ExpectimaxSearcher
-            searcher = ExpectimaxSearcher(model=model, device=device, depth=args.lookahead_depth)
-            selected_action, q_dict = searcher.search(info["board"], action_mask=mask)
+            searcher = ExpectimaxSearcher(
+                model=model,
+                device=device,
+                depth=args.lookahead_depth,
+                use_d4_symmetry=args.use_d4_symmetry,
+            )
+            selected_action, q_dict = searcher.search(
+                info["board"],
+                action_mask=mask,
+                depth=args.lookahead_depth,
+                use_d4_symmetry=args.use_d4_symmetry,
+            )
             q_vals_raw = np.array([q_dict[a] for a in range(4)], dtype=np.float32)
         else:
             obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)

@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 import torch
 
-from src.agent.search import ExpectimaxSearcher, expectimax_search
+from src.agent.search import (
+    ExpectimaxSearcher,
+    expectimax_search,
+    generate_d4_masks,
+    generate_d4_tensors,
+)
 from src.env.core import Action, Game2048Core
 from src.models.dueling_dqn import Dueling2048Net
 from src.training.agent import DDQNAgent
@@ -164,7 +169,83 @@ class TestExpectimaxSearcher:
             [0, 0, 0, 0],
         ], dtype=np.int64)
 
-        act, q_dict = expectimax_search(board, model=mock_model, depth=2)
+        act, q_dict = expectimax_search(board, model=mock_model, depth=2, use_d4_symmetry=True)
         assert isinstance(act, int)
         assert isinstance(q_dict, dict)
         assert len(q_dict) == 4
+
+    def test_generate_d4_tensors_distinct_permutations(self):
+        """Generate all 8 dihedral transformations on an asymmetric 4x4 matrix and ensure uniqueness."""
+        asym = torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4)
+        d4_tensors = generate_d4_tensors(asym)
+
+        assert d4_tensors.shape == (8, 1, 4, 4)
+        slices = [d4_tensors[k, 0].numpy() for k in range(8)]
+        for i in range(8):
+            for j in range(i + 1, 8):
+                assert not np.array_equal(slices[i], slices[j]), f"Transforms {i} and {j} should be distinct"
+
+    def test_d4_symmetrized_evaluation_rotation_invariance(self, mock_model):
+        """D4 symmetrization ensures V(s) == V(g * s) across all 8 dihedral group elements."""
+        board = np.array([
+            [2, 4, 8, 16],
+            [32, 64, 128, 256],
+            [512, 1024, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_d4_symmetry=True,
+        )
+
+        base_val = searcher._batch_evaluate_boards([board], use_d4=True)[0]
+
+        # Test all 4 rotations
+        for k in range(1, 4):
+            rot_b = np.rot90(board, k)
+            rot_val = searcher._batch_evaluate_boards([rot_b], use_d4=True)[0]
+            assert np.isclose(base_val, rot_val, atol=1e-4), (
+                f"Rotation k={k} value {rot_val:.5f} does not match base {base_val:.5f}"
+            )
+
+        # Test horizontal reflection and its rotations
+        flip_b = np.fliplr(board)
+        flip_val = searcher._batch_evaluate_boards([flip_b], use_d4=True)[0]
+        assert np.isclose(base_val, flip_val, atol=1e-4), "Reflection does not match base value"
+
+        for k in range(1, 4):
+            rot_flip_b = np.rot90(flip_b, k)
+            rot_flip_val = searcher._batch_evaluate_boards([rot_flip_b], use_d4=True)[0]
+            assert np.isclose(base_val, rot_flip_val, atol=1e-4), (
+                f"Flipped rotation k={k} does not match base value"
+            )
+
+    def test_d4_greedy_and_expectimax_execution(self, mock_model):
+        """Verify D4 symmetry execution in both greedy and 2-ply expectimax searches."""
+        board = np.array([
+            [2, 4, 8, 16],
+            [0, 4, 0, 8],
+            [2, 0, 4, 0],
+            [0, 2, 0, 4],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            depth=2,
+            use_d4_symmetry=True,
+        )
+
+        # Depth 0 with D4
+        act0, q0 = searcher.search(board, depth=0, use_d4_symmetry=True)
+        assert 0 <= act0 <= 3
+        assert len(q0) == 4
+
+        # Depth 2 with D4
+        act2, q2 = searcher.search(board, depth=2, use_d4_symmetry=True)
+        assert 0 <= act2 <= 3
+        assert len(q2) == 4
+        mask = Game2048Core().get_action_mask(board)
+        assert bool(mask[act2]) is True
