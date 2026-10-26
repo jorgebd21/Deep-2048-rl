@@ -1,0 +1,138 @@
+"""Interactive CLI playback visualizer for trained 2048 DRL models."""
+
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+import numpy as np
+import torch
+
+from src.env.wrapper import Game2048Env
+from src.models.dueling_dqn import Dueling2048Net
+from src.utils.cuda_utils import get_device, setup_ampere_tf32
+from src.utils.visualizer import clear_screen, render_board_ansi, render_hud
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line playback arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run real-time ANSI terminal visualizer for 2048 RL agent."
+    )
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt checkpoint")
+    parser.add_argument("--delay", type=float, default=0.1, help="Delay between steps in seconds")
+    parser.add_argument("--manual-step", action="store_true", help="Press Enter to execute next move")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
+    return parser.parse_args()
+
+
+def play(args: argparse.Namespace) -> None:
+    """Run interactive playback loop."""
+    setup_ampere_tf32()
+    if args.device == "auto":
+        device = get_device(prefer_gpu=True)
+    else:
+        device = torch.device(args.device)
+
+    env = Game2048Env()
+    obs, info = env.reset(seed=args.seed)
+
+    # Initialize model
+    model = Dueling2048Net(in_channels=16, num_actions=4).to(device)
+    model_loaded = False
+
+    if args.checkpoint is not None and os.path.exists(args.checkpoint):
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        state_dict = checkpoint.get("policy_net_state_dict", checkpoint)
+        model.load_state_dict(state_dict)
+        model_loaded = True
+        print(f"Loaded checkpoint from: {args.checkpoint}")
+    else:
+        if args.checkpoint is not None:
+            print(f"Warning: Checkpoint '{args.checkpoint}' not found. Using untrained policy.")
+        else:
+            print("No checkpoint specified. Running with untrained baseline policy.")
+
+    model.eval()
+
+    done = False
+    step = 0
+
+    while not done:
+        clear_screen()
+        print("\n" + "=" * 52)
+        status = "TRAINED CHECKPOINT" if model_loaded else "UNTRAINED BASELINE"
+        print(f"  DEEP 2048 RL LIVE AGENT VIEWER ({status})")
+        print("=" * 52 + "\n")
+
+        # Board rendering
+        print(render_board_ansi(info["board"]))
+        print()
+
+        # Compute Q-values with legal action mask
+        mask = info["action_mask"]
+        valid_actions = np.flatnonzero(mask)
+
+        if len(valid_actions) == 0:
+            break
+
+        obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+        mask_t = torch.from_numpy(mask).bool().unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            q_vals_masked = model(obs_t, action_mask=mask_t).squeeze(0).cpu().numpy()
+            q_vals_raw = model(obs_t).squeeze(0).cpu().numpy()
+
+        # Greedy legal action
+        selected_action = int(np.argmax(q_vals_masked))
+
+        # HUD rendering
+        print(
+            render_hud(
+                score=info["score"],
+                max_tile=info["max_tile"],
+                step=step,
+                action_mask=mask,
+                q_values=q_vals_raw,
+                selected_action=selected_action,
+            )
+        )
+
+        if args.manual_step:
+            try:
+                input("\n  [Press Enter to step, Ctrl+C to quit]...")
+            except (KeyboardInterrupt, EOFError):
+                print("\nPlayback interrupted by user.")
+                return
+        else:
+            time.sleep(args.delay)
+
+        # Step environment
+        obs, reward, terminated, truncated, info = env.step(selected_action)
+        done = terminated or truncated
+        step += 1
+
+    # Terminal state display
+    clear_screen()
+    print("\n" + "=" * 52)
+    print("  GAME OVER - FINAL RESULTS")
+    print("=" * 52 + "\n")
+    print(render_board_ansi(info["board"]))
+    print()
+    print(f"  Final Score      : {info['score']}")
+    print(f"  Max Tile Reached : {info['max_tile']}")
+    print(f"  Total Steps      : {step}")
+    print("=" * 52 + "\n")
+
+
+if __name__ == "__main__":
+    play(parse_args())
