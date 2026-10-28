@@ -661,9 +661,10 @@ class ExpectimaxSearcher:
         """5-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Action 3 -> Leaf Evaluation.
 
         Applies strict apex endgame pruning:
-            - Prunes actions that dislodge a locked corner tile.
-            - Chance nodes: expands only the primary tile spawn (tile 2) at top-1 priority cell
-              unless in immediate death risk.
+            - Prunes actions that dislodge a locked corner tile unless hazardous.
+            - When empty_cells <= 2, performs exact stochastic evaluation branching both tile 2 (90%)
+              and tile 4 (10%) across the empty cells.
+            - Otherwise expands the primary tile spawn (tile 2) at top-1 priority cell.
         """
         all_leaves: List[int] = []
         tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]] = {}
@@ -682,83 +683,80 @@ class ExpectimaxSearcher:
                 all_leaves.append(nb1)
                 continue
 
-            sampled1 = sorted(empty1, key=_PRIORITY_ORDER.get)[:1]
+            if num_empty1 <= 2:
+                sampled1 = empty1
+                spawn_candidates1 = [(2, 0.90), (4, 0.10)]
+            else:
+                sampled1 = sorted(empty1, key=_PRIORITY_ORDER.get)[:1]
+                spawn_candidates1 = [(2, 1.0)]
+
+            w_base1 = 1.0 / len(sampled1)
             chance1_branches = []
 
             for c1 in sampled1:
-                s1 = Bitboard2048.spawn_tile_at(nb1, c1, 2)
-                mask2 = Bitboard2048.get_action_mask(s1)
-                legal2 = np.flatnonzero(mask2)
+                for val1, p1 in spawn_candidates1:
+                    w1 = p1 * w_base1
+                    s1 = Bitboard2048.spawn_tile_at(nb1, c1, val1)
+                    mask2 = Bitboard2048.get_action_mask(s1)
+                    legal2 = np.flatnonzero(mask2)
 
-                # Death risk fallback: if primary cell yields death, check alternative cell
-                if len(legal2) == 0 and num_empty1 > 1:
-                    for c_alt in empty1[1:]:
-                        s_alt = Bitboard2048.spawn_tile_at(nb1, c_alt, 2)
-                        m_alt = Bitboard2048.get_action_mask(s_alt)
-                        l_alt = np.flatnonzero(m_alt)
-                        if len(l_alt) > 0:
-                            s1 = s_alt
-                            legal2 = l_alt
-                            break
-
-                if len(legal2) == 0:
-                    chance1_branches.append((1.0, []))
-                    continue
-
-                filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
-                act2_branches = []
-
-                for a2 in filt_actions2:
-                    nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
-                    if not ch2:
+                    if len(legal2) == 0:
+                        chance1_branches.append((w1, []))
                         continue
 
-                    empty2 = Bitboard2048.get_empty_cells(nb2)
-                    num_empty2 = len(empty2)
-                    if num_empty2 == 0:
-                        act2_branches.append((lr2, [(1.0, [(0.0, [(1.0, nb2)])])]))
-                        all_leaves.append(nb2)
-                        continue
+                    filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+                    act2_branches = []
 
-                    sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:1]
-                    chance2_branches = []
-
-                    for c2 in sampled2:
-                        s2 = Bitboard2048.spawn_tile_at(nb2, c2, 2)
-                        mask3 = Bitboard2048.get_action_mask(s2)
-                        legal3 = np.flatnonzero(mask3)
-
-                        if len(legal3) == 0 and num_empty2 > 1:
-                            for c2_alt in empty2[1:]:
-                                s2_alt = Bitboard2048.spawn_tile_at(nb2, c2_alt, 2)
-                                m2_alt = Bitboard2048.get_action_mask(s2_alt)
-                                l2_alt = np.flatnonzero(m2_alt)
-                                if len(l2_alt) > 0:
-                                    s2 = s2_alt
-                                    legal3 = l2_alt
-                                    break
-
-                        if len(legal3) == 0:
-                            chance2_branches.append((1.0, []))
+                    for a2 in filt_actions2:
+                        nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
+                        if not ch2:
                             continue
 
-                        filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
-                        act3_branches = []
+                        empty2 = Bitboard2048.get_empty_cells(nb2)
+                        num_empty2 = len(empty2)
+                        if num_empty2 == 0:
+                            act2_branches.append((lr2, [(1.0, [(0.0, nb2)])]))
+                            all_leaves.append(nb2)
+                            continue
 
-                        for a3 in filt_actions3:
-                            nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
-                            if ch3:
-                                act3_branches.append((lr3, nb3))
-                                all_leaves.append(nb3)
+                        if num_empty2 <= 2:
+                            sampled2 = empty2
+                            spawn_candidates2 = [(2, 0.90), (4, 0.10)]
+                        else:
+                            sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:1]
+                            spawn_candidates2 = [(2, 1.0)]
 
-                        if act3_branches:
-                            chance2_branches.append((1.0, act3_branches))
+                        w_base2 = 1.0 / len(sampled2)
+                        chance2_branches = []
 
-                    if chance2_branches:
-                        act2_branches.append((lr2, chance2_branches))
+                        for c2 in sampled2:
+                            for val2, p2 in spawn_candidates2:
+                                w2 = p2 * w_base2
+                                s2 = Bitboard2048.spawn_tile_at(nb2, c2, val2)
+                                mask3 = Bitboard2048.get_action_mask(s2)
+                                legal3 = np.flatnonzero(mask3)
 
-                if act2_branches:
-                    chance1_branches.append((1.0, act2_branches))
+                                if len(legal3) == 0:
+                                    chance2_branches.append((w2, []))
+                                    continue
+
+                                filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
+                                act3_branches = []
+
+                                for a3 in filt_actions3:
+                                    nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
+                                    if ch3:
+                                        act3_branches.append((lr3, nb3))
+                                        all_leaves.append(nb3)
+
+                                if act3_branches:
+                                    chance2_branches.append((w2, act3_branches))
+
+                        if chance2_branches:
+                            act2_branches.append((lr2, chance2_branches))
+
+                    if act2_branches:
+                        chance1_branches.append((w1, act2_branches))
 
             if chance1_branches:
                 tree[a1] = (lr1, chance1_branches)
@@ -780,20 +778,17 @@ class ExpectimaxSearcher:
                         if not chance2_branches:
                             q2 = lr2
                         else:
-                            best_q3 = -1e9
+                            exp_v2 = 0.0
                             for w2, act3_branches in chance2_branches:
                                 if not act3_branches:
-                                    q3 = 0.0
+                                    best_q3 = 0.0
                                 else:
-                                    q3 = max(
+                                    best_q3 = max(
                                         lr3 + self.gamma * self.tt.get(Bitboard2048.get_canonical(nb3), 0.0)
                                         for lr3, nb3 in act3_branches
                                     )
-                                if q3 > best_q3:
-                                    best_q3 = q3
-                            if best_q3 == -1e9:
-                                best_q3 = 0.0
-                            q2 = lr2 + self.gamma * best_q3
+                                exp_v2 += w2 * best_q3
+                            q2 = lr2 + self.gamma * exp_v2
                         if q2 > best_q2:
                             best_q2 = q2
                     if best_q2 == -1e9:
@@ -813,7 +808,9 @@ class ExpectimaxSearcher:
     ) -> Tuple[int, Dict[int, float]]:
         """6-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Action 3 -> Chance 3 -> Leaf Evaluation.
 
-        Applies strict apex endgame pruning for extreme 1-empty cell boards.
+        Applies apex endgame pruning for extreme endgames:
+            - Prunes actions that dislodge a locked corner tile unless hazardous.
+            - When empty_cells <= 2, evaluates both tile 2 (90%) and tile 4 (10%) spawns.
         """
         all_leaves: List[int] = []
         tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]]]] = {}
@@ -826,63 +823,113 @@ class ExpectimaxSearcher:
                 continue
 
             empty1 = Bitboard2048.get_empty_cells(nb1)
-            if len(empty1) == 0:
+            num_empty1 = len(empty1)
+            if num_empty1 == 0:
                 tree[a1] = (lr1, [(1.0, [(0.0, [(1.0, [(0.0, [(1.0, [(0.0, nb1)])])])])])])
                 all_leaves.append(nb1)
                 continue
 
-            c1 = sorted(empty1, key=_PRIORITY_ORDER.get)[0]
-            s1 = Bitboard2048.spawn_tile_at(nb1, c1, 2)
-            mask2 = Bitboard2048.get_action_mask(s1)
-            legal2 = np.flatnonzero(mask2)
-            if len(legal2) == 0:
-                continue
+            if num_empty1 <= 2:
+                sampled1 = empty1
+                spawn_candidates1 = [(2, 0.90), (4, 0.10)]
+            else:
+                sampled1 = sorted(empty1, key=_PRIORITY_ORDER.get)[:1]
+                spawn_candidates1 = [(2, 1.0)]
 
-            filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
-            act2_branches = []
+            w_base1 = 1.0 / len(sampled1)
+            chance1_branches = []
 
-            for a2 in filt_actions2:
-                nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
-                if not ch2:
-                    continue
-
-                empty2 = Bitboard2048.get_empty_cells(nb2)
-                if len(empty2) == 0:
-                    act2_branches.append((lr2, [(1.0, [(0.0, [(1.0, [(0.0, nb2)])])])]))
-                    all_leaves.append(nb2)
-                    continue
-
-                c2 = sorted(empty2, key=_PRIORITY_ORDER.get)[0]
-                s2 = Bitboard2048.spawn_tile_at(nb2, c2, 2)
-                mask3 = Bitboard2048.get_action_mask(s2)
-                legal3 = np.flatnonzero(mask3)
-                if len(legal3) == 0:
-                    continue
-
-                filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
-                act3_branches = []
-
-                for a3 in filt_actions3:
-                    nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
-                    if not ch3:
+            for c1 in sampled1:
+                for val1, p1 in spawn_candidates1:
+                    w1 = p1 * w_base1
+                    s1 = Bitboard2048.spawn_tile_at(nb1, c1, val1)
+                    mask2 = Bitboard2048.get_action_mask(s1)
+                    legal2 = np.flatnonzero(mask2)
+                    if len(legal2) == 0:
+                        chance1_branches.append((w1, []))
                         continue
 
-                    empty3 = Bitboard2048.get_empty_cells(nb3)
-                    if len(empty3) == 0:
-                        act3_branches.append((lr3, [(1.0, nb3)]))
-                        all_leaves.append(nb3)
-                        continue
+                    filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+                    act2_branches = []
 
-                    c3 = sorted(empty3, key=_PRIORITY_ORDER.get)[0]
-                    s3 = Bitboard2048.spawn_tile_at(nb3, c3, 2)
-                    act3_branches.append((lr3, [(1.0, s3)]))
-                    all_leaves.append(s3)
+                    for a2 in filt_actions2:
+                        nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
+                        if not ch2:
+                            continue
 
-                if act3_branches:
-                    act2_branches.append((lr2, [(1.0, act3_branches)]))
+                        empty2 = Bitboard2048.get_empty_cells(nb2)
+                        num_empty2 = len(empty2)
+                        if num_empty2 == 0:
+                            act2_branches.append((lr2, [(1.0, [(0.0, [(1.0, [(0.0, nb2)])])])]))
+                            all_leaves.append(nb2)
+                            continue
 
-            if act2_branches:
-                tree[a1] = (lr1, [(1.0, act2_branches)])
+                        if num_empty2 <= 2:
+                            sampled2 = empty2
+                            spawn_candidates2 = [(2, 0.90), (4, 0.10)]
+                        else:
+                            sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:1]
+                            spawn_candidates2 = [(2, 1.0)]
+
+                        w_base2 = 1.0 / len(sampled2)
+                        chance2_branches = []
+
+                        for c2 in sampled2:
+                            for val2, p2 in spawn_candidates2:
+                                w2 = p2 * w_base2
+                                s2 = Bitboard2048.spawn_tile_at(nb2, c2, val2)
+                                mask3 = Bitboard2048.get_action_mask(s2)
+                                legal3 = np.flatnonzero(mask3)
+                                if len(legal3) == 0:
+                                    chance2_branches.append((w2, []))
+                                    continue
+
+                                filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
+                                act3_branches = []
+
+                                for a3 in filt_actions3:
+                                    nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
+                                    if not ch3:
+                                        continue
+
+                                    empty3 = Bitboard2048.get_empty_cells(nb3)
+                                    num_empty3 = len(empty3)
+                                    if num_empty3 == 0:
+                                        act3_branches.append((lr3, [(1.0, nb3)]))
+                                        all_leaves.append(nb3)
+                                        continue
+
+                                    if num_empty3 <= 2:
+                                        sampled3 = empty3
+                                        spawn_candidates3 = [(2, 0.90), (4, 0.10)]
+                                    else:
+                                        sampled3 = sorted(empty3, key=_PRIORITY_ORDER.get)[:1]
+                                        spawn_candidates3 = [(2, 1.0)]
+
+                                    w_base3 = 1.0 / len(sampled3)
+                                    chance3_branches = []
+
+                                    for c3 in sampled3:
+                                        for val3, p3 in spawn_candidates3:
+                                            w3 = p3 * w_base3
+                                            s3 = Bitboard2048.spawn_tile_at(nb3, c3, val3)
+                                            chance3_branches.append((w3, s3))
+                                            all_leaves.append(s3)
+
+                                    if chance3_branches:
+                                        act3_branches.append((lr3, chance3_branches))
+
+                                if act3_branches:
+                                    chance2_branches.append((w2, act3_branches))
+
+                        if chance2_branches:
+                            act2_branches.append((lr2, chance2_branches))
+
+                    if act2_branches:
+                        chance1_branches.append((w1, act2_branches))
+
+            if chance1_branches:
+                tree[a1] = (lr1, chance1_branches)
 
         if not tree:
             return self._search_depth_5(bb, legal_actions, use_d4=use_d4, use_snake=use_snake)
@@ -893,25 +940,39 @@ class ExpectimaxSearcher:
         for a1, (lr1, chance1_branches) in tree.items():
             exp_v1 = 0.0
             for w1, act2_branches in chance1_branches:
-                best_q2 = -1e9
-                for lr2, chance2_branches in act2_branches:
-                    best_q3 = -1e9
-                    for w2, act3_branches in chance2_branches:
-                        for lr3, chance3_branches in act3_branches:
-                            exp_v3 = sum(
-                                w3 * self.tt.get(Bitboard2048.get_canonical(s3), 0.0)
-                                for w3, s3 in chance3_branches
-                            )
-                            q3 = lr3 + self.gamma * exp_v3
-                            if q3 > best_q3:
-                                best_q3 = q3
-                    if best_q3 == -1e9:
-                        best_q3 = 0.0
-                    q2 = lr2 + self.gamma * best_q3
-                    if q2 > best_q2:
-                        best_q2 = q2
-                if best_q2 == -1e9:
+                if not act2_branches:
                     best_q2 = 0.0
+                else:
+                    best_q2 = -1e9
+                    for lr2, chance2_branches in act2_branches:
+                        if not chance2_branches:
+                            q2 = lr2
+                        else:
+                            exp_v2 = 0.0
+                            for w2, act3_branches in chance2_branches:
+                                if not act3_branches:
+                                    best_q3 = 0.0
+                                else:
+                                    best_q3 = -1e9
+                                    for lr3, chance3_branches in act3_branches:
+                                        if not chance3_branches:
+                                            q3 = lr3
+                                        else:
+                                            exp_v3 = sum(
+                                                w3 * self.tt.get(Bitboard2048.get_canonical(s3), 0.0)
+                                                for w3, s3 in chance3_branches
+                                            )
+                                            q3 = lr3 + self.gamma * exp_v3
+                                        if q3 > best_q3:
+                                            best_q3 = q3
+                                    if best_q3 == -1e9:
+                                        best_q3 = 0.0
+                                exp_v2 += w2 * best_q3
+                            q2 = lr2 + self.gamma * exp_v2
+                        if q2 > best_q2:
+                            best_q2 = q2
+                    if best_q2 == -1e9:
+                        best_q2 = 0.0
                 exp_v1 += w1 * best_q2
             q_dict[a1] = lr1 + self.gamma * exp_v1
 

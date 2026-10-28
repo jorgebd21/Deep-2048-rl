@@ -254,8 +254,25 @@ class TestBitboardCoreParity:
         assert Bitboard2048.get_adaptive_depth(bb1, apex_mode=True) == 6
 
     def test_filter_corner_preserving_actions(self):
-        """Corner-preserving filter must prune actions that dislodge a locked corner tile."""
+        """Corner-preserving filter must prune actions that dislodge a locked corner tile when safe."""
         # 2048 at (0, 0); moving DOWN (action 3) moves 2048 to (1, 0)
+        # Row 3 has adjacent 8s to merge, ensuring positive survival margin for LEFT
+        b = np.array([
+            [2048, 2, 4, 8],
+            [0, 16, 32, 64],
+            [1024, 128, 256, 512],
+            [512, 4, 8, 8],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(b)
+        legal = [Action.LEFT, Action.UP, Action.DOWN]
+        filt = Bitboard2048.filter_corner_preserving_actions(bb, legal)
+        assert Action.DOWN not in filt
+        assert Action.LEFT in filt
+
+    def test_filter_corner_preserving_actions_relaxed_on_deadlock(self):
+        """When all corner-preserving actions lead to immediate deadlock, filter must relax."""
+        # Board where LEFT and UP keep 2048 in corner but every spawn yields 0 legal actions (deadlock)
+        # DOWN dislodges 2048 to (1, 0) but allows future merges
         b = np.array([
             [2048, 2, 4, 8],
             [0, 16, 32, 64],
@@ -265,7 +282,8 @@ class TestBitboardCoreParity:
         bb = Bitboard2048.from_array(b)
         legal = [Action.LEFT, Action.UP, Action.DOWN]
         filt = Bitboard2048.filter_corner_preserving_actions(bb, legal)
-        assert Action.DOWN not in filt
+        # Filter must relax and allow DOWN to escape the deadlock
+        assert Action.DOWN in filt
         assert Action.LEFT in filt
         assert Action.UP in filt
 

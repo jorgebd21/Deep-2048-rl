@@ -453,16 +453,65 @@ class Bitboard2048:
             return 3
 
     @classmethod
+    def compute_survival_margin(cls, nb: int) -> float:
+        """Compute the survival margin for an afterstate board.
+
+        A positive value indicates healthy continuation headroom.
+        A negative value indicates immediate game-over or near-certain deadlock upon tile spawn.
+        """
+        empty_cells = cls.get_empty_cells(nb)
+        if not empty_cells:
+            # Full board after move: check if any immediate merges are possible
+            mask = cls.get_action_mask(nb)
+            return 1.0 if np.any(mask) else -10.0
+
+        if len(empty_cells) >= 4:
+            return float(len(empty_cells))
+
+        min_legal = 4
+        total_legal = 0
+        total_spawns = 0
+        dead_spawns = 0
+
+        for c in empty_cells:
+            for val in (2, 4):
+                s = cls.spawn_tile_at(nb, c, val)
+                mask = cls.get_action_mask(s)
+                n_legal = int(np.count_nonzero(mask))
+                if n_legal == 0:
+                    dead_spawns += 1
+                if n_legal < min_legal:
+                    min_legal = n_legal
+                total_legal += n_legal
+                total_spawns += 1
+
+        if total_spawns == 0:
+            return -10.0
+
+        # If all spawns lead to game over, survival margin is definitely negative
+        if dead_spawns == total_spawns:
+            return -10.0
+
+        # If any spawn leads to immediate death on tight boards (empty <= 2)
+        if dead_spawns > 0 and len(empty_cells) <= 2:
+            return -5.0 * (dead_spawns / total_spawns)
+
+        avg_legal = total_legal / total_spawns
+        return float(len(empty_cells) + avg_legal - 2.0)
+
+    @classmethod
     def filter_corner_preserving_actions(
         cls,
         bb: int,
         legal_actions: Sequence[int],
     ) -> List[int]:
-        """Prune actions that dislodge an established corner lock.
+        """Prune actions that dislodge an established corner lock unless hazardous.
 
-        If the maximum tile (rank >= 7, >= 128) is in an outer corner, prune any
-        action that moves it out of outer corners, provided at least one legal action
-        preserves the corner lock.
+        If the maximum tile (rank >= 7, >= 128) is in an outer corner:
+        - Filters actions that maintain the maximum tile in an outer corner.
+        - Relaxes hard filtering: If ALL corner-preserving actions have negative
+          survival margin (i.e. leading to immediate death or inescapable deadlock),
+          allows non-corner moves (returns all legal actions) so the agent can escape.
         """
         ranks = [(bb >> (4 * i)) & 0xF for i in range(16)]
         k_max = max(ranks)
@@ -475,15 +524,29 @@ class Bitboard2048:
             return list(legal_actions)
 
         preserving: List[int] = []
+        preserving_margins: List[float] = []
+
         for a in legal_actions:
             nb, _, _, ch = cls.move(bb, a)
             if not ch:
                 continue
             nb_ranks = [(nb >> (4 * i)) & 0xF for i in range(16)]
             if any(nb_ranks[c] == k_max for c in corner_indices):
+                margin = cls.compute_survival_margin(nb)
                 preserving.append(int(a))
+                preserving_margins.append(margin)
 
-        return preserving if preserving else list(legal_actions)
+        if not preserving:
+            return list(legal_actions)
+
+        # If ALL corner-preserving moves have negative survival margin,
+        # allow non-corner moves (return all legal actions).
+        if all(m < 0 for m in preserving_margins):
+            return list(legal_actions)
+
+        # Filter to preserving actions with safe (non-negative) survival margin
+        safe_preserving = [a for a, m in zip(preserving, preserving_margins) if m >= 0]
+        return safe_preserving if safe_preserving else preserving
 
     @staticmethod
     def get_empty_cells(bb: int) -> List[int]:
