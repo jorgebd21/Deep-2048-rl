@@ -229,6 +229,46 @@ class TestBitboardCoreParity:
         ], dtype=np.int64)
         assert Bitboard2048.get_adaptive_depth(Bitboard2048.from_array(b_endgame)) == 4
 
+    def test_apex_depth_selection(self):
+        """Apex mode must elevate lookahead to 5-ply (empty<=2) and 6-ply (empty==1)."""
+        # Apex 5-ply (empty 2, max 2048)
+        b_apex2 = np.array([
+            [2048, 1024, 512, 256],
+            [128, 64, 32, 16],
+            [8, 4, 2, 4],
+            [2, 4, 0, 0],
+        ], dtype=np.int64)
+        bb2 = Bitboard2048.from_array(b_apex2)
+        assert Bitboard2048.get_adaptive_depth(bb2, apex_mode=False) == 4
+        assert Bitboard2048.get_adaptive_depth(bb2, apex_mode=True) == 5
+
+        # Apex 6-ply (empty 1, max 4096)
+        b_apex1 = np.array([
+            [4096, 2048, 1024, 512],
+            [256, 128, 64, 32],
+            [16, 8, 4, 2],
+            [4, 2, 4, 0],
+        ], dtype=np.int64)
+        bb1 = Bitboard2048.from_array(b_apex1)
+        assert Bitboard2048.get_adaptive_depth(bb1, apex_mode=False) == 4
+        assert Bitboard2048.get_adaptive_depth(bb1, apex_mode=True) == 6
+
+    def test_filter_corner_preserving_actions(self):
+        """Corner-preserving filter must prune actions that dislodge a locked corner tile."""
+        # 2048 at (0, 0); moving DOWN (action 3) moves 2048 to (1, 0)
+        b = np.array([
+            [2048, 2, 4, 8],
+            [0, 16, 32, 64],
+            [1024, 128, 256, 512],
+            [512, 4, 8, 16],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(b)
+        legal = [Action.LEFT, Action.UP, Action.DOWN]
+        filt = Bitboard2048.filter_corner_preserving_actions(bb, legal)
+        assert Action.DOWN not in filt
+        assert Action.LEFT in filt
+        assert Action.UP in filt
+
 
 class TestAfterstateLearningAndAugmentation:
     """Validate Afterstate buffer serialization and network loss computations."""

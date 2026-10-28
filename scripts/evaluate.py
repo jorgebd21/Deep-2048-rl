@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
     parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply)")
     parser.add_argument("--adaptive-depth", action="store_true", default=False, help="Dynamically adjust depth (2-ply early, 3-ply mid, 4-ply endgame)")
+    parser.add_argument("--apex-mode", action="store_true", default=False, help="Enable 5-ply and 6-ply depth in apex endgames")
     parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
     parser.add_argument("--use-snake-heuristic", action="store_true", default=True, help="Enable topological snake monotonicity and corner shield (default: True)")
     parser.add_argument("--no-snake-heuristic", action="store_false", dest="use_snake_heuristic", help="Disable topological snake monotonicity and corner shield")
@@ -48,6 +49,7 @@ def evaluate_agent(
     max_empty_samples: Optional[int] = None,
     use_d4_symmetry: bool = False,
     adaptive_depth: bool = False,
+    apex_mode: bool = False,
     use_snake_heuristic: bool = True,
     alpha_snake: float = 0.5,
     beta_corner: float = 1.0,
@@ -58,7 +60,7 @@ def evaluate_agent(
     env = Game2048Env()
 
     searcher: Optional[ExpectimaxSearcher] = None
-    if lookahead_depth > 0 or adaptive_depth or use_d4_symmetry:
+    if lookahead_depth > 0 or adaptive_depth or apex_mode or use_d4_symmetry:
         searcher = ExpectimaxSearcher(
             model=model,
             device=dev,
@@ -66,6 +68,7 @@ def evaluate_agent(
             max_empty_samples=max_empty_samples,
             use_d4_symmetry=use_d4_symmetry,
             adaptive_depth=adaptive_depth,
+            apex_mode=apex_mode,
             use_snake_heuristic=use_snake_heuristic,
             alpha_snake=alpha_snake,
             beta_corner=beta_corner,
@@ -77,7 +80,9 @@ def evaluate_agent(
 
     d4_str = " + D4 Symmetry" if use_d4_symmetry else ""
     snake_str = " + Snake Shield" if use_snake_heuristic else ""
-    if adaptive_depth:
+    if apex_mode:
+        search_mode_str = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_str}{snake_str}"
+    elif adaptive_depth:
         search_mode_str = f"Adaptive Depth Expectimax{d4_str}{snake_str}"
     elif lookahead_depth > 0:
         search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}{snake_str}"
@@ -140,6 +145,7 @@ def evaluate_agent(
         "num_episodes": episodes,
         "lookahead_depth": lookahead_depth,
         "adaptive_depth": adaptive_depth,
+        "apex_mode": apex_mode,
         "use_d4_symmetry": use_d4_symmetry,
         "use_snake_heuristic": use_snake_heuristic,
         "alpha_snake": alpha_snake,
@@ -157,6 +163,7 @@ def evaluate_agent(
         "reach_2048_rate": float(np.mean(tiles_arr >= 2048)),
         "reach_4096_rate": float(np.mean(tiles_arr >= 4096)),
         "reach_8192_rate": float(np.mean(tiles_arr >= 8192)),
+        "reach_16384_rate": float(np.mean(tiles_arr >= 16384)),
         "tile_distribution": tile_dist,
     }
 
@@ -238,6 +245,7 @@ def main() -> None:
         max_empty_samples=args.max_empty_samples,
         use_d4_symmetry=args.use_d4_symmetry,
         adaptive_depth=args.adaptive_depth,
+        apex_mode=args.apex_mode,
         use_snake_heuristic=args.use_snake_heuristic,
         alpha_snake=args.alpha_snake,
         beta_corner=args.beta_corner,
@@ -251,7 +259,9 @@ def main() -> None:
 
     d4_label = " + D4 Symmetry" if args.use_d4_symmetry else ""
     snake_label = " + Snake Shield" if args.use_snake_heuristic else ""
-    if args.adaptive_depth:
+    if args.apex_mode:
+        search_label = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_label}{snake_label}"
+    elif args.adaptive_depth:
         search_label = f"Adaptive Depth Expectimax{d4_label}{snake_label}"
     elif args.lookahead_depth > 0:
         search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}{snake_label}"
@@ -261,7 +271,13 @@ def main() -> None:
     print(f" MONTE CARLO EVALUATION REPORT ({search_label})")
     print("=" * 65)
     print(f"  Episodes Evaluated  : {results['num_episodes']}")
-    print(f"  Lookahead Depth     : {'Adaptive (2..4)' if results['adaptive_depth'] else results['lookahead_depth']}")
+    if results['apex_mode']:
+        depth_str = "Apex Adaptive (2..6 ply)"
+    elif results['adaptive_depth']:
+        depth_str = "Adaptive (2..4 ply)"
+    else:
+        depth_str = str(results['lookahead_depth'])
+    print(f"  Lookahead Depth     : {depth_str}")
     print(f"  D4 Symmetrization   : {'Enabled' if results['use_d4_symmetry'] else 'Disabled'}")
     print(f"  Snake Shield        : {'Enabled (alpha={:.2f}, beta={:.2f})'.format(results['alpha_snake'], results['beta_corner']) if results['use_snake_heuristic'] else 'Disabled'}")
     print(f"  Elapsed Time        : {results['elapsed_seconds']:.2f} s")
@@ -277,6 +293,7 @@ def main() -> None:
     print(f"    Reach 2048+       : {results['reach_2048_rate'] * 100:6.1f}%")
     print(f"    Reach 4096+       : {results['reach_4096_rate'] * 100:6.1f}%")
     print(f"    Reach 8192+       : {results['reach_8192_rate'] * 100:6.1f}%")
+    print(f"    Reach 16384+      : {results.get('reach_16384_rate', 0.0) * 100:6.1f}%")
     print("  " + "-" * 45)
     print("  Max Tile Frequency Distribution:")
     for tile, count in sorted(results["tile_distribution"].items()):

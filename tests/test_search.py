@@ -368,3 +368,38 @@ class TestExpectimaxSearcher:
         assert 0 <= act <= 3
         mask = Game2048Core().get_action_mask(board)
         assert bool(mask[act]) is True
+
+    def test_apex_depth_5_and_6_search(self, mock_model):
+        """Verify 5-ply and 6-ply search execute and return valid legal moves under apex pruning."""
+        # 2 empty cells (apex depth 5)
+        b_apex2 = np.array([
+            [2048, 1024, 512, 256],
+            [128, 64, 32, 16],
+            [8, 4, 2, 4],
+            [2, 4, 0, 0],
+        ], dtype=np.int64)
+
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            adaptive_depth=True,
+            apex_mode=True,
+        )
+
+        act5, q5 = searcher.search(b_apex2, depth=5)
+        assert 0 <= act5 <= 3
+        mask5 = Game2048Core().get_action_mask(b_apex2)
+        assert bool(mask5[act5]) is True
+
+        # 1 empty cell (apex depth 6)
+        b_apex1 = np.array([
+            [4096, 2048, 1024, 512],
+            [256, 128, 64, 32],
+            [16, 8, 4, 2],
+            [4, 2, 4, 0],
+        ], dtype=np.int64)
+
+        act6, q6 = searcher.search(b_apex1, depth=6)
+        assert 0 <= act6 <= 3
+        mask6 = Game2048Core().get_action_mask(b_apex1)
+        assert bool(mask6[act6]) is True

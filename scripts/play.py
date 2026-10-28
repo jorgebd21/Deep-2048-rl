@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Seed for game initialization")
     parser.add_argument("--lookahead-depth", type=int, default=0, help="Expectimax lookahead search depth (0 for greedy, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply)")
     parser.add_argument("--adaptive-depth", action="store_true", default=False, help="Dynamically adjust depth (2-ply early, 3-ply mid, 4-ply endgame)")
+    parser.add_argument("--apex-mode", action="store_true", default=False, help="Enable 5-ply and 6-ply depth in apex endgames")
     parser.add_argument("--use-d4-symmetry", action="store_true", default=False, help="Enable 8-fold dihedral D4 symmetry invariance in search")
     parser.add_argument("--use-snake-heuristic", action="store_true", default=True, help="Enable topological snake monotonicity and corner shield (default: True)")
     parser.add_argument("--no-snake-heuristic", action="store_false", dest="use_snake_heuristic", help="Disable topological snake monotonicity and corner shield")
@@ -116,7 +117,7 @@ def play(args: argparse.Namespace) -> None:
     step = 0
 
     searcher = None
-    if args.lookahead_depth > 0 or args.adaptive_depth or args.use_d4_symmetry:
+    if args.lookahead_depth > 0 or args.adaptive_depth or args.apex_mode or args.use_d4_symmetry:
         from src.agent.search import ExpectimaxSearcher
         searcher = ExpectimaxSearcher(
             model=model,
@@ -124,6 +125,7 @@ def play(args: argparse.Namespace) -> None:
             depth=args.lookahead_depth,
             use_d4_symmetry=args.use_d4_symmetry,
             adaptive_depth=args.adaptive_depth,
+            apex_mode=args.apex_mode,
             use_snake_heuristic=args.use_snake_heuristic,
             alpha_snake=args.alpha_snake,
             beta_corner=args.beta_corner,
@@ -134,7 +136,9 @@ def play(args: argparse.Namespace) -> None:
         print("\n" + "=" * 52)
         d4_str = " + D4" if args.use_d4_symmetry else ""
         snake_str = " + Snake" if args.use_snake_heuristic else ""
-        if args.adaptive_depth:
+        if args.apex_mode:
+            mode_str = f"APEX ADAPTIVE EXPECTIMAX{d4_str}{snake_str}"
+        elif args.adaptive_depth:
             mode_str = f"ADAPTIVE EXPECTIMAX{d4_str}{snake_str}"
         elif args.lookahead_depth > 0:
             mode_str = f"{args.lookahead_depth}-PLY EXPECTIMAX{d4_str}{snake_str}"
@@ -162,6 +166,7 @@ def play(args: argparse.Namespace) -> None:
                 depth=args.lookahead_depth,
                 use_d4_symmetry=args.use_d4_symmetry,
                 adaptive_depth=args.adaptive_depth,
+                apex_mode=args.apex_mode,
                 use_snake_heuristic=args.use_snake_heuristic,
             )
             q_vals_raw = np.array([q_dict[a] for a in range(4)], dtype=np.float32)

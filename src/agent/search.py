@@ -16,7 +16,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.env.core import Action, Game2048Core
-from src.env.bitboard import Bitboard2048, SNAKE_WEIGHTS_8x16
+from src.env.bitboard import (
+    Bitboard2048,
+    SNAKE_WEIGHTS_8x16,
+    compute_d4_structural_scores,
+)
 from src.env.wrapper import _POWER_LUT, MAX_TILE_VAL, one_hot_encode_board
 from src.utils.cuda_utils import get_device
 
@@ -101,6 +105,7 @@ class ExpectimaxSearcher:
         use_d4_symmetry: bool = False,
         tt_max_size: int = 500_000,
         adaptive_depth: bool = False,
+        apex_mode: bool = False,
         use_snake_heuristic: bool = True,
         alpha_snake: float = 0.5,
         beta_corner: float = 1.0,
@@ -117,6 +122,7 @@ class ExpectimaxSearcher:
             use_d4_symmetry: Whether to enable 8-fold Dihedral D4 symmetry ensembling.
             tt_max_size: Maximum entries in the Transposition Table before pruning.
             adaptive_depth: Whether to dynamically select lookahead depth based on board state.
+            apex_mode: Whether to enable 5-ply / 6-ply search in extreme endgames.
             use_snake_heuristic: Whether to blend topological snake monotonicity and corner lock shield.
             alpha_snake: Weight for snake monotonicity score (default 0.5).
             beta_corner: Weight for corner dislodgement penalty (default 1.0).
@@ -129,6 +135,7 @@ class ExpectimaxSearcher:
         self.use_d4_symmetry = use_d4_symmetry
         self.tt_max_size = tt_max_size
         self.adaptive_depth = adaptive_depth
+        self.apex_mode = apex_mode
         self.use_snake_heuristic = use_snake_heuristic
         self.alpha_snake = alpha_snake
         self.beta_corner = beta_corner
@@ -146,6 +153,7 @@ class ExpectimaxSearcher:
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
         adaptive_depth: Optional[bool] = None,
+        apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
     ) -> int:
         """Select best action using lookahead search.
@@ -156,6 +164,7 @@ class ExpectimaxSearcher:
             depth: Optional search depth overriding instance default.
             use_d4_symmetry: Optional D4 symmetry toggle overriding instance default.
             adaptive_depth: Optional adaptive depth toggle overriding instance default.
+            apex_mode: Optional apex mode toggle overriding instance default.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance default.
 
         Returns:
@@ -167,6 +176,7 @@ class ExpectimaxSearcher:
             depth=depth,
             use_d4_symmetry=use_d4_symmetry,
             adaptive_depth=adaptive_depth,
+            apex_mode=apex_mode,
             use_snake_heuristic=use_snake_heuristic,
         )
         return best_action
@@ -178,6 +188,7 @@ class ExpectimaxSearcher:
         depth: Optional[int] = None,
         use_d4_symmetry: Optional[bool] = None,
         adaptive_depth: Optional[bool] = None,
+        apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
     ) -> Tuple[int, Dict[int, float]]:
         """Perform Expectimax search from current board state.
@@ -185,9 +196,10 @@ class ExpectimaxSearcher:
         Args:
             board: 4x4 integer numpy array or 64-bit bitboard integer.
             action_mask: Optional boolean array of shape (4,). If None, calculated via bitboard/core.
-            depth: Search depth (0, 1, 2, 3, or 4). Defaults to self.depth if adaptive_depth is False.
+            depth: Search depth (0, 1, 2, 3, 4, 5, or 6). Defaults to self.depth if adaptive_depth is False.
             use_d4_symmetry: Optional D4 toggle overriding instance setting.
             adaptive_depth: Optional adaptive depth toggle overriding instance setting.
+            apex_mode: Optional apex mode toggle overriding instance setting.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance setting.
 
         Returns:
@@ -202,8 +214,9 @@ class ExpectimaxSearcher:
             np_board = None
 
         is_adaptive = self.adaptive_depth if adaptive_depth is None else adaptive_depth
+        is_apex = self.apex_mode if apex_mode is None else apex_mode
         if is_adaptive:
-            d = Bitboard2048.get_adaptive_depth(bb)
+            d = Bitboard2048.get_adaptive_depth(bb, apex_mode=is_apex)
         else:
             d = self.depth if depth is None else depth
 
@@ -238,8 +251,12 @@ class ExpectimaxSearcher:
             return self._search_depth_2(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         elif d == 3:
             return self._search_depth_3(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
-        elif d >= 4:
+        elif d == 4:
             return self._search_depth_4(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
+        elif d == 5:
+            return self._search_depth_5(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
+        elif d >= 6:
+            return self._search_depth_6(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
         else:
             return self._search_depth_2(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
 
@@ -626,6 +643,281 @@ class ExpectimaxSearcher:
         best_action = max(tree.keys(), key=lambda a: q_dict[a])
         return int(best_action), q_dict
 
+    def _filter_corner_preserving_actions(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+    ) -> List[int]:
+        """Prune actions that dislodge a locked maximum tile from outer corners."""
+        return Bitboard2048.filter_corner_preserving_actions(bb, legal_actions)
+
+    def _search_depth_5(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+        use_d4: bool = False,
+        use_snake: bool = True,
+    ) -> Tuple[int, Dict[int, float]]:
+        """5-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Action 3 -> Leaf Evaluation.
+
+        Applies strict apex endgame pruning:
+            - Prunes actions that dislodge a locked corner tile.
+            - Chance nodes: expands only the primary tile spawn (tile 2) at top-1 priority cell
+              unless in immediate death risk.
+        """
+        all_leaves: List[int] = []
+        tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]] = {}
+
+        filt_actions1 = self._filter_corner_preserving_actions(bb, legal_actions)
+
+        for a1 in filt_actions1:
+            nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
+            if not ch1:
+                continue
+
+            empty1 = Bitboard2048.get_empty_cells(nb1)
+            num_empty1 = len(empty1)
+            if num_empty1 == 0:
+                tree[a1] = (lr1, [(1.0, [(0.0, [(1.0, [(0.0, [(1.0, nb1)])])])])])
+                all_leaves.append(nb1)
+                continue
+
+            sampled1 = sorted(empty1, key=_PRIORITY_ORDER.get)[:1]
+            chance1_branches = []
+
+            for c1 in sampled1:
+                s1 = Bitboard2048.spawn_tile_at(nb1, c1, 2)
+                mask2 = Bitboard2048.get_action_mask(s1)
+                legal2 = np.flatnonzero(mask2)
+
+                # Death risk fallback: if primary cell yields death, check alternative cell
+                if len(legal2) == 0 and num_empty1 > 1:
+                    for c_alt in empty1[1:]:
+                        s_alt = Bitboard2048.spawn_tile_at(nb1, c_alt, 2)
+                        m_alt = Bitboard2048.get_action_mask(s_alt)
+                        l_alt = np.flatnonzero(m_alt)
+                        if len(l_alt) > 0:
+                            s1 = s_alt
+                            legal2 = l_alt
+                            break
+
+                if len(legal2) == 0:
+                    chance1_branches.append((1.0, []))
+                    continue
+
+                filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+                act2_branches = []
+
+                for a2 in filt_actions2:
+                    nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
+                    if not ch2:
+                        continue
+
+                    empty2 = Bitboard2048.get_empty_cells(nb2)
+                    num_empty2 = len(empty2)
+                    if num_empty2 == 0:
+                        act2_branches.append((lr2, [(1.0, [(0.0, [(1.0, nb2)])])]))
+                        all_leaves.append(nb2)
+                        continue
+
+                    sampled2 = sorted(empty2, key=_PRIORITY_ORDER.get)[:1]
+                    chance2_branches = []
+
+                    for c2 in sampled2:
+                        s2 = Bitboard2048.spawn_tile_at(nb2, c2, 2)
+                        mask3 = Bitboard2048.get_action_mask(s2)
+                        legal3 = np.flatnonzero(mask3)
+
+                        if len(legal3) == 0 and num_empty2 > 1:
+                            for c2_alt in empty2[1:]:
+                                s2_alt = Bitboard2048.spawn_tile_at(nb2, c2_alt, 2)
+                                m2_alt = Bitboard2048.get_action_mask(s2_alt)
+                                l2_alt = np.flatnonzero(m2_alt)
+                                if len(l2_alt) > 0:
+                                    s2 = s2_alt
+                                    legal3 = l2_alt
+                                    break
+
+                        if len(legal3) == 0:
+                            chance2_branches.append((1.0, []))
+                            continue
+
+                        filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
+                        act3_branches = []
+
+                        for a3 in filt_actions3:
+                            nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
+                            if ch3:
+                                act3_branches.append((lr3, nb3))
+                                all_leaves.append(nb3)
+
+                        if act3_branches:
+                            chance2_branches.append((1.0, act3_branches))
+
+                    if chance2_branches:
+                        act2_branches.append((lr2, chance2_branches))
+
+                if act2_branches:
+                    chance1_branches.append((1.0, act2_branches))
+
+            if chance1_branches:
+                tree[a1] = (lr1, chance1_branches)
+
+        if not tree:
+            return self._search_depth_4(bb, legal_actions, use_d4=use_d4, use_snake=use_snake)
+
+        self._ensure_evaluated(all_leaves, use_d4=use_d4, use_snake=use_snake)
+
+        q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
+        for a1, (lr1, chance1_branches) in tree.items():
+            exp_v1 = 0.0
+            for w1, act2_branches in chance1_branches:
+                if not act2_branches:
+                    best_q2 = 0.0
+                else:
+                    best_q2 = -1e9
+                    for lr2, chance2_branches in act2_branches:
+                        if not chance2_branches:
+                            q2 = lr2
+                        else:
+                            best_q3 = -1e9
+                            for w2, act3_branches in chance2_branches:
+                                if not act3_branches:
+                                    q3 = 0.0
+                                else:
+                                    q3 = max(
+                                        lr3 + self.gamma * self.tt.get(Bitboard2048.get_canonical(nb3), 0.0)
+                                        for lr3, nb3 in act3_branches
+                                    )
+                                if q3 > best_q3:
+                                    best_q3 = q3
+                            if best_q3 == -1e9:
+                                best_q3 = 0.0
+                            q2 = lr2 + self.gamma * best_q3
+                        if q2 > best_q2:
+                            best_q2 = q2
+                    if best_q2 == -1e9:
+                        best_q2 = 0.0
+                exp_v1 += w1 * best_q2
+            q_dict[a1] = lr1 + self.gamma * exp_v1
+
+        best_action = max(tree.keys(), key=lambda a: q_dict[a])
+        return int(best_action), q_dict
+
+    def _search_depth_6(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+        use_d4: bool = False,
+        use_snake: bool = True,
+    ) -> Tuple[int, Dict[int, float]]:
+        """6-ply Expectimax: Action 1 -> Chance 1 -> Action 2 -> Chance 2 -> Action 3 -> Chance 3 -> Leaf Evaluation.
+
+        Applies strict apex endgame pruning for extreme 1-empty cell boards.
+        """
+        all_leaves: List[int] = []
+        tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]]]] = {}
+
+        filt_actions1 = self._filter_corner_preserving_actions(bb, legal_actions)
+
+        for a1 in filt_actions1:
+            nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
+            if not ch1:
+                continue
+
+            empty1 = Bitboard2048.get_empty_cells(nb1)
+            if len(empty1) == 0:
+                tree[a1] = (lr1, [(1.0, [(0.0, [(1.0, [(0.0, [(1.0, [(0.0, nb1)])])])])])])
+                all_leaves.append(nb1)
+                continue
+
+            c1 = sorted(empty1, key=_PRIORITY_ORDER.get)[0]
+            s1 = Bitboard2048.spawn_tile_at(nb1, c1, 2)
+            mask2 = Bitboard2048.get_action_mask(s1)
+            legal2 = np.flatnonzero(mask2)
+            if len(legal2) == 0:
+                continue
+
+            filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+            act2_branches = []
+
+            for a2 in filt_actions2:
+                nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
+                if not ch2:
+                    continue
+
+                empty2 = Bitboard2048.get_empty_cells(nb2)
+                if len(empty2) == 0:
+                    act2_branches.append((lr2, [(1.0, [(0.0, [(1.0, [(0.0, nb2)])])])]))
+                    all_leaves.append(nb2)
+                    continue
+
+                c2 = sorted(empty2, key=_PRIORITY_ORDER.get)[0]
+                s2 = Bitboard2048.spawn_tile_at(nb2, c2, 2)
+                mask3 = Bitboard2048.get_action_mask(s2)
+                legal3 = np.flatnonzero(mask3)
+                if len(legal3) == 0:
+                    continue
+
+                filt_actions3 = self._filter_corner_preserving_actions(s2, legal3)
+                act3_branches = []
+
+                for a3 in filt_actions3:
+                    nb3, _, lr3, ch3 = Bitboard2048.move(s2, a3)
+                    if not ch3:
+                        continue
+
+                    empty3 = Bitboard2048.get_empty_cells(nb3)
+                    if len(empty3) == 0:
+                        act3_branches.append((lr3, [(1.0, nb3)]))
+                        all_leaves.append(nb3)
+                        continue
+
+                    c3 = sorted(empty3, key=_PRIORITY_ORDER.get)[0]
+                    s3 = Bitboard2048.spawn_tile_at(nb3, c3, 2)
+                    act3_branches.append((lr3, [(1.0, s3)]))
+                    all_leaves.append(s3)
+
+                if act3_branches:
+                    act2_branches.append((lr2, [(1.0, act3_branches)]))
+
+            if act2_branches:
+                tree[a1] = (lr1, [(1.0, act2_branches)])
+
+        if not tree:
+            return self._search_depth_5(bb, legal_actions, use_d4=use_d4, use_snake=use_snake)
+
+        self._ensure_evaluated(all_leaves, use_d4=use_d4, use_snake=use_snake)
+
+        q_dict: Dict[int, float] = {a: -1e9 for a in range(4)}
+        for a1, (lr1, chance1_branches) in tree.items():
+            exp_v1 = 0.0
+            for w1, act2_branches in chance1_branches:
+                best_q2 = -1e9
+                for lr2, chance2_branches in act2_branches:
+                    best_q3 = -1e9
+                    for w2, act3_branches in chance2_branches:
+                        for lr3, chance3_branches in act3_branches:
+                            exp_v3 = sum(
+                                w3 * self.tt.get(Bitboard2048.get_canonical(s3), 0.0)
+                                for w3, s3 in chance3_branches
+                            )
+                            q3 = lr3 + self.gamma * exp_v3
+                            if q3 > best_q3:
+                                best_q3 = q3
+                    if best_q3 == -1e9:
+                        best_q3 = 0.0
+                    q2 = lr2 + self.gamma * best_q3
+                    if q2 > best_q2:
+                        best_q2 = q2
+                if best_q2 == -1e9:
+                    best_q2 = 0.0
+                exp_v1 += w1 * best_q2
+            q_dict[a1] = lr1 + self.gamma * exp_v1
+
+        best_action = max(tree.keys(), key=lambda a: q_dict[a])
+        return int(best_action), q_dict
+
     def _batch_evaluate_boards(
         self,
         boards: Sequence[Union[np.ndarray, int]],
@@ -706,6 +998,9 @@ class ExpectimaxSearcher:
             ranks_flat = exps.reshape(n, 16).astype(np.float32)
             # Dot product with 8x16 snake templates and take maximum
             snake_scores = np.max(np.dot(ranks_flat, SNAKE_WEIGHTS_8x16.T), axis=1)
+            # Add refined structural scores (row 0/1 monotonicity, connectivity, inversion penalty)
+            struct_scores = compute_d4_structural_scores(exps)
+            total_snake_scores = snake_scores + struct_scores
 
             # Vectorized corner penalty
             k_max = np.max(ranks_flat, axis=1)
@@ -730,7 +1025,7 @@ class ExpectimaxSearcher:
             has_legal_np = masks_np.any(axis=-1)
             v_final = np.where(
                 has_legal_np,
-                v_np + self.alpha_snake * snake_scores - self.beta_corner * penalties,
+                v_np + self.alpha_snake * total_snake_scores - self.beta_corner * penalties,
                 0.0,
             )
             return v_final.astype(np.float32)
@@ -747,6 +1042,7 @@ def expectimax_search(
     max_empty_samples: Optional[int] = None,
     use_d4_symmetry: bool = False,
     adaptive_depth: bool = False,
+    apex_mode: bool = False,
     use_snake_heuristic: bool = True,
     alpha_snake: float = 0.5,
     beta_corner: float = 1.0,
@@ -760,6 +1056,7 @@ def expectimax_search(
         max_empty_samples=max_empty_samples,
         use_d4_symmetry=use_d4_symmetry,
         adaptive_depth=adaptive_depth,
+        apex_mode=apex_mode,
         use_snake_heuristic=use_snake_heuristic,
         alpha_snake=alpha_snake,
         beta_corner=beta_corner,
@@ -769,5 +1066,6 @@ def expectimax_search(
         depth=depth,
         use_d4_symmetry=use_d4_symmetry,
         adaptive_depth=adaptive_depth,
+        apex_mode=apex_mode,
         use_snake_heuristic=use_snake_heuristic,
     )

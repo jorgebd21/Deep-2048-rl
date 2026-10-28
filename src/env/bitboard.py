@@ -8,7 +8,7 @@ Precomputes 16-bit tables (65,536 entries) for slide-and-merge moves,
 achieving tens of millions of moves/sec per core.
 """
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 import math
 import numpy as np
 
@@ -74,8 +74,8 @@ def _build_luts() -> Tuple[
 ) = _build_luts()
 
 
-def _build_snake_weights(base: float = 3.0) -> np.ndarray:
-    """Precompute the 8 Dihedral D4 snake monotonicity weight vectors of shape (8, 16)."""
+def _build_snake_weights(base: float = 2.8) -> np.ndarray:
+    """Precompute the 8 Dihedral D4 snake monotonicity weight vectors with smooth decay."""
     p1 = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
     idx_grid = np.arange(16).reshape(4, 4)
     d4_grids = [
@@ -100,7 +100,102 @@ def _build_snake_weights(base: float = 3.0) -> np.ndarray:
     return snake_weights
 
 
-SNAKE_WEIGHTS_8x16 = _build_snake_weights(base=3.0)
+def compute_d4_structural_scores(exps: np.ndarray) -> np.ndarray:
+    """Compute Dihedral D4 snake row monotonicity, vertical connectivity, and inversion penalties.
+
+    Evaluates structural alignment strictly on actual non-zero tiles (ignoring empty cells):
+        1. Row 0 monotonicity (decreasing left-to-right between adjacent positive tiles).
+        2. Row 1 monotonicity (decreasing right-to-left between adjacent positive tiles).
+        3. Vertical connectivity between row 0 end [0, 3] and row 1 start [1, 3].
+        4. Tile inversion penalty: penalizes smaller positive tiles trapped between larger tiles.
+
+    Args:
+        exps: Array of shape (N, 4, 4) containing tile exponent ranks [0..15].
+
+    Returns:
+        1D float32 array of shape (N,) containing maximal structural score across all 8 D4 orientations.
+    """
+    N = exps.shape[0]
+    if N == 0:
+        return np.array([], dtype=np.float32)
+
+    r0 = exps
+    r1 = np.rot90(exps, 1, (1, 2))
+    r2 = np.rot90(exps, 2, (1, 2))
+    r3 = np.rot90(exps, 3, (1, 2))
+    f = np.flip(exps, axis=2)
+    fr0 = f
+    fr1 = np.rot90(f, 1, (1, 2))
+    fr2 = np.rot90(f, 2, (1, 2))
+    fr3 = np.rot90(f, 3, (1, 2))
+
+    all_d4 = np.concatenate([r0, r1, r2, r3, fr0, fr1, fr2, fr3], axis=0)  # (8*N, 4, 4)
+
+    # 1. Row 0 monotonicity between adjacent positive tiles
+    g0 = all_d4[:, 0, :].astype(np.int16)
+    p01 = (g0[:, 0] > 0) & (g0[:, 1] > 0)
+    p12 = (g0[:, 1] > 0) & (g0[:, 2] > 0)
+    p23 = (g0[:, 2] > 0) & (g0[:, 3] > 0)
+    p02_skip = (g0[:, 0] > 0) & (g0[:, 1] == 0) & (g0[:, 2] > 0)
+    p13_skip = (g0[:, 1] > 0) & (g0[:, 2] == 0) & (g0[:, 3] > 0)
+
+    non_mono0 = (
+        np.maximum(0, g0[:, 1] - g0[:, 0]) * p01
+        + np.maximum(0, g0[:, 2] - g0[:, 1]) * p12
+        + np.maximum(0, g0[:, 3] - g0[:, 2]) * p23
+        + np.maximum(0, g0[:, 2] - g0[:, 0]) * p02_skip
+        + np.maximum(0, g0[:, 3] - g0[:, 1]) * p13_skip
+    )
+    mono0_bonus = (
+        (g0[:, 0] >= g0[:, 1]) * p01
+        + (g0[:, 1] >= g0[:, 2]) * p12
+        + (g0[:, 2] >= g0[:, 3]) * p23
+        + (g0[:, 0] >= g0[:, 2]) * p02_skip
+        + (g0[:, 1] >= g0[:, 3]) * p13_skip
+    ) * 0.5
+
+    # 2. Row 1 monotonicity (decreasing right-to-left: c3 >= c2 >= c1 >= c0)
+    g1 = all_d4[:, 1, :].astype(np.int16)
+    q32 = (g1[:, 3] > 0) & (g1[:, 2] > 0)
+    q21 = (g1[:, 2] > 0) & (g1[:, 1] > 0)
+    q10 = (g1[:, 1] > 0) & (g1[:, 0] > 0)
+    q31_skip = (g1[:, 3] > 0) & (g1[:, 2] == 0) & (g1[:, 1] > 0)
+    q20_skip = (g1[:, 2] > 0) & (g1[:, 1] == 0) & (g1[:, 0] > 0)
+
+    non_mono1 = (
+        np.maximum(0, g1[:, 2] - g1[:, 3]) * q32
+        + np.maximum(0, g1[:, 1] - g1[:, 2]) * q21
+        + np.maximum(0, g1[:, 0] - g1[:, 1]) * q10
+        + np.maximum(0, g1[:, 1] - g1[:, 3]) * q31_skip
+        + np.maximum(0, g1[:, 0] - g1[:, 2]) * q20_skip
+    )
+    mono1_bonus = (
+        (g1[:, 3] >= g1[:, 2]) * q32
+        + (g1[:, 2] >= g1[:, 1]) * q21
+        + (g1[:, 1] >= g1[:, 0]) * q10
+        + (g1[:, 3] >= g1[:, 1]) * q31_skip
+        + (g1[:, 2] >= g1[:, 0]) * q20_skip
+    ) * 0.25
+
+    # 3. Vertical connectivity between row 0 end [0, 3] and row 1 start [1, 3]
+    t03 = all_d4[:, 0, 3].astype(np.int16)
+    t13 = all_d4[:, 1, 3].astype(np.int16)
+    both_pos = (t03 > 0) & (t13 > 0)
+    conn = np.where(both_pos, np.where(t03 >= t13, 1.0 + np.where((t03 - t13) <= 1, 1.0, 0.0), -(t13 - t03) * 1.5), 0.0)
+
+    # 4. Trapped tile inversion penalty on boundary lines (only applies to positive tiles)
+    inv1 = ((g0[:, 1] > 0) & (g0[:, 1] < g0[:, 0]) & (g0[:, 1] < g0[:, 2]) & (g0[:, 0] >= 3) & (g0[:, 2] >= 3)) * (np.minimum(g0[:, 0], g0[:, 2]) - g0[:, 1]) * 2.0
+    inv2 = ((g0[:, 2] > 0) & (g0[:, 2] < g0[:, 1]) & (g0[:, 2] < g0[:, 3]) & (g0[:, 1] >= 3) & (g0[:, 3] >= 3)) * (np.minimum(g0[:, 1], g0[:, 3]) - g0[:, 2]) * 2.0
+
+    c0 = all_d4[:, :, 0].astype(np.int16)
+    inv_col = ((c0[:, 1] > 0) & (c0[:, 1] < c0[:, 0]) & (c0[:, 1] < c0[:, 2]) & (c0[:, 0] >= 3) & (c0[:, 2] >= 3)) * (np.minimum(c0[:, 0], c0[:, 2]) - c0[:, 1]) * 2.0
+
+    scores = mono0_bonus + mono1_bonus + conn - 1.0 * non_mono0 - 0.5 * non_mono1 - inv1 - inv2 - inv_col
+    scores_8n = scores.reshape(8, N)
+    return np.max(scores_8n, axis=0).astype(np.float32)
+
+
+SNAKE_WEIGHTS_8x16 = _build_snake_weights(base=2.8)
 
 
 class Bitboard2048:
@@ -288,10 +383,14 @@ class Bitboard2048:
 
     @classmethod
     def compute_snake_score(cls, bb: int) -> float:
-        """Compute maximum Dihedral D4 snake monotonicity score."""
+        """Compute maximum Dihedral D4 snake monotonicity, connectivity, and gradient score."""
         ranks = np.array([(bb >> (4 * i)) & 0xF for i in range(16)], dtype=np.float32)
         scores = np.dot(SNAKE_WEIGHTS_8x16, ranks)
-        return float(np.max(scores))
+        base_dot = float(np.max(scores))
+
+        exps = cls.to_exponents_array(bb)[None, ...]
+        struct_score = float(compute_d4_structural_scores(exps)[0])
+        return base_dot + struct_score
 
     @classmethod
     def compute_corner_penalty(cls, bb: int) -> float:
@@ -320,11 +419,17 @@ class Bitboard2048:
         return float(k_max * 1.0)
 
     @classmethod
-    def get_adaptive_depth(cls, bb: int) -> int:
+    def get_adaptive_depth(cls, bb: int, apex_mode: bool = False) -> int:
         """Determine dynamic Expectimax lookahead depth based on board complexity.
 
+        Args:
+            bb: 64-bit integer bitboard.
+            apex_mode: If True, extends search to 5-ply and 6-ply in extreme endgames.
+
         Returns:
-            4 for Critical End Game (empty <= 4 and max tile >= 1024)
+            6 for Apex Endgame (empty == 1 and max tile >= 2048, apex_mode only)
+            5 for Apex Endgame (empty <= 2 and max tile >= 2048, apex_mode only)
+            4 for Endgame (empty <= 4 and max tile >= 1024)
             2 for Early/Open Game (empty >= 8 and max tile < 1024)
             3 for Mid Game (otherwise)
         """
@@ -332,12 +437,53 @@ class Bitboard2048:
         max_rank = max((bb >> (4 * i)) & 0xF for i in range(16))
         max_tile = (1 << max_rank) if max_rank > 0 else 0
 
-        if empty_count <= 4 and max_tile >= 1024:
+        if apex_mode and max_tile >= 2048:
+            if empty_count <= 1:
+                return 6
+            elif empty_count <= 2:
+                return 5
+            elif empty_count <= 4:
+                return 4
+        elif empty_count <= 4 and max_tile >= 1024:
             return 4
-        elif empty_count >= 8 and max_tile < 1024:
+
+        if empty_count >= 8 and max_tile < 1024:
             return 2
         else:
             return 3
+
+    @classmethod
+    def filter_corner_preserving_actions(
+        cls,
+        bb: int,
+        legal_actions: Sequence[int],
+    ) -> List[int]:
+        """Prune actions that dislodge an established corner lock.
+
+        If the maximum tile (rank >= 7, >= 128) is in an outer corner, prune any
+        action that moves it out of outer corners, provided at least one legal action
+        preserves the corner lock.
+        """
+        ranks = [(bb >> (4 * i)) & 0xF for i in range(16)]
+        k_max = max(ranks)
+        if k_max < 7:
+            return list(legal_actions)
+
+        corner_indices = (0, 3, 12, 15)
+        locked_corners = [c for c in corner_indices if ranks[c] == k_max]
+        if not locked_corners:
+            return list(legal_actions)
+
+        preserving: List[int] = []
+        for a in legal_actions:
+            nb, _, _, ch = cls.move(bb, a)
+            if not ch:
+                continue
+            nb_ranks = [(nb >> (4 * i)) & 0xF for i in range(16)]
+            if any(nb_ranks[c] == k_max for c in corner_indices):
+                preserving.append(int(a))
+
+        return preserving if preserving else list(legal_actions)
 
     @staticmethod
     def get_empty_cells(bb: int) -> List[int]:
