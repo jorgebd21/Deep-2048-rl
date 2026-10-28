@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-snake-heuristic", action="store_false", dest="use_snake_heuristic", help="Disable topological snake monotonicity and corner shield")
     parser.add_argument("--alpha-snake", type=float, default=0.5, help="Weight for snake monotonicity score")
     parser.add_argument("--beta-corner", type=float, default=1.0, help="Weight for corner dislodgement penalty")
+    parser.add_argument("--use-afterstate-net", action="store_true", default=False, help="Use scalar afterstate value head V(s_after) for leaf evaluation")
     parser.add_argument("--max-empty-samples", type=int, default=None, help="Max empty cells to sample per chance node (default: evaluate all empty cells)")
     parser.add_argument("--save-json", type=str, default=None, help="Save evaluation metrics to JSON file")
     return parser.parse_args()
@@ -53,6 +54,7 @@ def evaluate_agent(
     use_snake_heuristic: bool = True,
     alpha_snake: float = 0.5,
     beta_corner: float = 1.0,
+    use_afterstate_net: bool = False,
 ) -> Dict[str, Any]:
     """Execute deterministic evaluation runs and compute aggregate performance statistics."""
     dev = device or torch.device("cpu")
@@ -60,7 +62,7 @@ def evaluate_agent(
     env = Game2048Env()
 
     searcher: Optional[ExpectimaxSearcher] = None
-    if lookahead_depth > 0 or adaptive_depth or apex_mode or use_d4_symmetry:
+    if lookahead_depth > 0 or adaptive_depth or apex_mode or use_d4_symmetry or use_afterstate_net:
         searcher = ExpectimaxSearcher(
             model=model,
             device=dev,
@@ -72,6 +74,7 @@ def evaluate_agent(
             use_snake_heuristic=use_snake_heuristic,
             alpha_snake=alpha_snake,
             beta_corner=beta_corner,
+            use_afterstate_net=use_afterstate_net,
         )
 
     scores: List[float] = []
@@ -222,11 +225,17 @@ def main() -> None:
 
     model = Dueling2048Net(in_channels=16, num_actions=4).to(device)
 
+    use_afterstate_net = args.use_afterstate_net
+
     checkpoint_path = resolve_checkpoint_path(args.checkpoint)
     if checkpoint_path is not None:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if isinstance(checkpoint, dict):
             state_dict = checkpoint.get("policy_net_state_dict", checkpoint.get("model_state_dict", checkpoint))
+            metadata = checkpoint.get("metadata", {})
+            if metadata.get("afterstate", False) or metadata.get("model_mode") == "afterstate":
+                use_afterstate_net = True
+                print("  Model Mode          : Native Afterstate Value Network V(s_after)")
         else:
             state_dict = checkpoint
         model.load_state_dict(state_dict)
@@ -249,6 +258,7 @@ def main() -> None:
         use_snake_heuristic=args.use_snake_heuristic,
         alpha_snake=args.alpha_snake,
         beta_corner=args.beta_corner,
+        use_afterstate_net=use_afterstate_net,
     )
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":

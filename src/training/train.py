@@ -37,9 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-freq", type=int, default=1, help="Vectorized steps between gradient updates")
     parser.add_argument("--eval-freq", type=int, default=50, help="Evaluation frequency in episodes")
     parser.add_argument("--eval-episodes", type=int, default=10, help="Episodes per evaluation run")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory where models are saved")
+    parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory where models are saved")
     parser.add_argument("--resume", "--load-checkpoint", dest="resume", type=str, default=None, help="Path to checkpoint file (.pt) to resume training from")
     parser.add_argument("--resume-epsilon", type=float, default=0.15, help="Exploration epsilon when resuming (default: 0.15)")
+    parser.add_argument("--train-afterstate", action="store_true", default=False, help="Enable Expert Iteration with Native Afterstate Value Learning V(s_after)")
+    parser.add_argument("--expert-lookahead-depth", type=int, default=2, help="Lookahead depth for expert self-play trajectory generation (default: 2)")
+    parser.add_argument("--max-grad-norm", type=float, default=None, help="Gradient clipping max norm (default: 10.0 for afterstate, 1.0 for DDQN)")
     parser.add_argument("--log-dir", type=str, default=None, help="TensorBoard log directory")
     parser.add_argument("--no-tensorboard", action="store_true", help="Disable TensorBoard")
     parser.add_argument("--no-tqdm", action="store_true", help="Disable tqdm progress bar")
@@ -60,15 +63,36 @@ def main() -> None:
         device = torch.device(args.device)
 
     gpu_info = get_gpu_telemetry()
-    mode_str = "Single Env" if args.single_env else f"Vectorized ({args.num_envs} Parallel Envs)"
+    if args.train_afterstate:
+        mode_str = f"Expert Iteration (Afterstate V(s_after), Depth {args.expert_lookahead_depth})"
+    elif args.single_env:
+        mode_str = "Single Env"
+    else:
+        mode_str = f"Vectorized ({args.num_envs} Parallel Envs)"
+
+    # Resolve learning rate and max_grad_norm defaults
+    lr = args.lr
+    if args.train_afterstate and args.lr == 1e-4:
+        lr = 5e-5  # Default fine-tuning learning rate
+
+    max_grad_norm = args.max_grad_norm
+    if max_grad_norm is None:
+        max_grad_norm = 10.0 if args.train_afterstate else 1.0
 
     # Defensive checkpoint directory resolution
-    checkpoint_dir = args.checkpoint_dir
+    if args.checkpoint_dir is not None:
+        checkpoint_dir = args.checkpoint_dir
+    elif args.train_afterstate:
+        checkpoint_dir = "checkpoints/afterstate"
+    else:
+        checkpoint_dir = "checkpoints"
+
     if os.path.isfile(checkpoint_dir):
         checkpoint_dir = os.path.dirname(checkpoint_dir) or "checkpoints"
 
+    pipeline_title = "EXPERT ITERATION AFTERSTATE" if args.train_afterstate else "DDQN"
     print("\n" + "=" * 65, flush=True)
-    print(" DEEP 2048 REINFORCEMENT LEARNING - DDQN TRAINING PIPELINE", flush=True)
+    print(f" DEEP 2048 REINFORCEMENT LEARNING - {pipeline_title} PIPELINE", flush=True)
     print("=" * 65, flush=True)
     print(f"  Target Device       : {device}", flush=True)
     if gpu_info["device_available"]:
@@ -78,7 +102,8 @@ def main() -> None:
     print(f"  Execution Mode      : {mode_str}", flush=True)
     print(f"  Total Episodes      : {args.episodes}", flush=True)
     print(f"  Mini-Batch Size     : {args.batch_size}", flush=True)
-    print(f"  Learning Rate       : {args.lr}", flush=True)
+    print(f"  Learning Rate       : {lr}", flush=True)
+    print(f"  Max Grad Norm       : {max_grad_norm}", flush=True)
     print(f"  Discount Factor     : {args.gamma}", flush=True)
     print(f"  PER Capacity        : {args.buffer_capacity}", flush=True)
     print(f"  Checkpoint Dir      : {checkpoint_dir}", flush=True)
@@ -95,9 +120,10 @@ def main() -> None:
     agent = DDQNAgent(
         in_channels=16,
         num_actions=4,
-        lr=args.lr,
+        lr=lr,
         gamma=args.gamma,
         tau=args.tau,
+        max_grad_norm=max_grad_norm,
         device=device,
     )
 
@@ -136,6 +162,8 @@ def main() -> None:
         enable_tensorboard=not args.no_tensorboard,
         use_tqdm=not args.no_tqdm,
         seed=args.seed,
+        train_afterstate=args.train_afterstate,
+        expert_lookahead_depth=args.expert_lookahead_depth,
     )
 
     trainer = Trainer(env=env, agent=agent, buffer=buffer, config=config)

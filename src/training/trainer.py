@@ -38,6 +38,10 @@ class TrainingConfig:
     pin_memory: bool = True
     use_tqdm: bool = True
     d4_augmentation: bool = True
+    train_afterstate: bool = False
+    expert_lookahead_depth: int = 2
+    expert_warmup_episodes: int = 10
+    gradient_steps_per_expert_episode: int = 30
 
 
 class Trainer:
@@ -99,8 +103,41 @@ class Trainer:
             except ImportError:
                 self.writer = None
 
+    def warmup_afterstate(self) -> None:
+        """Populate buffer with expert afterstate trajectories using Expectimax lookahead search."""
+        from src.agent.search import ExpectimaxSearcher
+        from src.training.expert_iteration import populate_buffer_with_expert_trajectories
+
+        searcher = ExpectimaxSearcher(
+            model=self.agent.policy_net,
+            device=self.agent.device,
+            depth=self.config.expert_lookahead_depth,
+            use_snake_heuristic=True,
+        )
+        print(
+            f"\n[Expert Iteration] Warming up buffer with {self.config.expert_warmup_episodes} "
+            f"expert self-play games (Depth {self.config.expert_lookahead_depth})...",
+            flush=True,
+        )
+        res = populate_buffer_with_expert_trajectories(
+            buffer=self.buffer,
+            searcher=searcher,
+            num_episodes=self.config.expert_warmup_episodes,
+            depth=self.config.expert_lookahead_depth,
+            base_seed=self.config.seed or 42,
+        )
+        print(
+            f"[Expert Iteration] Warmup complete: {res['transitions_added']} transitions gathered "
+            f"(Mean score: {res['mean_score']:.0f}, Max tile: {res['max_tile']}) in {res['elapsed_sec']:.1f}s.",
+            flush=True,
+        )
+
     def warmup(self) -> None:
-        """Populate experience buffer with uniform random legal transitions."""
+        """Populate experience buffer with uniform random legal transitions or expert afterstates."""
+        if self.config.train_afterstate:
+            self.warmup_afterstate()
+            return
+
         if isinstance(self.env, VectorizedGame2048Env):
             obs, infos = self.env.reset(seed=self.config.seed)
             boards = np.array([inf["board"] for inf in infos])
@@ -175,17 +212,34 @@ class Trainer:
         eval_max_tiles = []
         eval_lengths = []
 
+        searcher = None
+        if self.config.train_afterstate:
+            from src.agent.search import ExpectimaxSearcher
+            searcher = ExpectimaxSearcher(
+                model=self.agent.policy_net,
+                device=self.agent.device,
+                depth=self.config.expert_lookahead_depth,
+                use_afterstate_net=True,
+                use_snake_heuristic=True,
+            )
+
         for ep_idx in range(n_eps):
             obs, info = self.eval_env.reset()
             done = False
             ep_steps = 0
 
             while not done:
-                action = self.agent.select_action(
-                    state=obs,
-                    action_mask=info["action_mask"],
-                    deterministic=True,
-                )
+                if searcher is not None:
+                    action = searcher.select_action(
+                        board=info["board"],
+                        action_mask=info["action_mask"],
+                    )
+                else:
+                    action = self.agent.select_action(
+                        state=obs,
+                        action_mask=info["action_mask"],
+                        deterministic=True,
+                    )
                 obs, reward, terminated, truncated, info = self.eval_env.step(action)
                 done = terminated or truncated
                 ep_steps += 1
@@ -220,15 +274,27 @@ class Trainer:
         if len(self.buffer) < self.config.batch_size:
             return None
 
-        batch = self.buffer.sample(
-            self.config.batch_size,
-            device=self.agent.device,
-            pin_memory=self.config.pin_memory,
-        )
-        if self.config.d4_augmentation:
-            from src.utils.cuda_utils import apply_random_d4_augmentation
-            batch = apply_random_d4_augmentation(batch)
-        loss, td_errors = self.agent.update(batch)
+        if self.config.train_afterstate:
+            batch = self.buffer.sample_afterstate(
+                self.config.batch_size,
+                device=self.agent.device,
+                pin_memory=self.config.pin_memory,
+            )
+            if self.config.d4_augmentation:
+                from src.utils.cuda_utils import apply_random_d4_augmentation
+                batch = apply_random_d4_augmentation(batch)
+            loss, td_errors = self.agent.update_afterstate(batch)
+        else:
+            batch = self.buffer.sample(
+                self.config.batch_size,
+                device=self.agent.device,
+                pin_memory=self.config.pin_memory,
+            )
+            if self.config.d4_augmentation:
+                from src.utils.cuda_utils import apply_random_d4_augmentation
+                batch = apply_random_d4_augmentation(batch)
+            loss, td_errors = self.agent.update(batch)
+
         self.total_opt_steps += 1
 
         # Update PER tree priorities
@@ -503,8 +569,131 @@ class Trainer:
 
         return self.history
 
+    def _train_afterstate(self, total_episodes: int) -> Dict[str, Any]:
+        """Execute Expert Iteration training loop with Bitboard lookahead and native afterstate optimization."""
+        from tqdm import tqdm
+        from src.agent.search import ExpectimaxSearcher
+        from src.training.expert_iteration import collect_afterstate_trajectory
+
+        searcher = ExpectimaxSearcher(
+            model=self.agent.policy_net,
+            device=self.agent.device,
+            depth=self.config.expert_lookahead_depth,
+            use_snake_heuristic=True,
+            use_afterstate_net=True,
+        )
+
+        pbar = None
+        if self.config.use_tqdm:
+            pbar = tqdm(
+                total=total_episodes,
+                desc="Expert Iteration (Afterstate)",
+                dynamic_ncols=True,
+                file=sys.stdout,
+            )
+
+        recent_scores: List[float] = []
+        recent_tiles: List[float] = []
+        recent_losses: List[float] = []
+
+        for ep in range(1, total_episodes + 1):
+            ep_seed = (self.config.seed or 42) + ep
+            traj = collect_afterstate_trajectory(
+                searcher=searcher,
+                depth=self.config.expert_lookahead_depth,
+                seed=ep_seed,
+            )
+
+            ep_score = float(traj["score"])
+            ep_tile = float(traj["max_tile"])
+            ep_steps = float(traj["steps"])
+            transitions = traj["transitions"]
+
+            for s_after, r_next, next_s_after, done in transitions:
+                self.buffer.add_afterstate(
+                    afterstate=s_after,
+                    reward=r_next,
+                    next_afterstate=next_s_after,
+                    done=done,
+                )
+            self.total_env_steps += len(transitions)
+
+            self.history["episode_scores"].append(ep_score)
+            self.history["episode_max_tiles"].append(ep_tile)
+            self.history["episode_lengths"].append(ep_steps)
+
+            recent_scores.append(ep_score)
+            recent_tiles.append(ep_tile)
+            if len(recent_scores) > 30:
+                recent_scores.pop(0)
+                recent_tiles.pop(0)
+
+            # Gradient updates per expert episode
+            ep_losses = []
+            grad_steps = self.config.gradient_steps_per_expert_episode
+            for _ in range(grad_steps):
+                loss = self.train_step()
+                if loss is not None:
+                    ep_losses.append(loss)
+                    recent_losses.append(loss)
+                    if len(recent_losses) > 50:
+                        recent_losses.pop(0)
+
+            if ep_losses:
+                self.history["losses"].append(float(np.mean(ep_losses)))
+
+            if pbar is not None:
+                pbar.update(1)
+                mean_sc = np.mean(recent_scores) if recent_scores else 0.0
+                max_t = int(max(recent_tiles)) if recent_tiles else 0
+                avg_loss = np.mean(recent_losses) if recent_losses else 0.0
+                pbar.set_postfix({
+                    "score": f"{mean_sc:.0f}",
+                    "max_tile": f"{max_t}",
+                    "loss": f"{avg_loss:.3f}",
+                    "buf": f"{len(self.buffer)}",
+                })
+                sys.stdout.flush()
+
+            # Periodic evaluation
+            if ep % self.config.eval_freq == 0:
+                eval_metrics = self.evaluate()
+                self.history["eval_scores"].append(eval_metrics["mean_score"])
+                self.history["eval_max_tiles"].append(eval_metrics["max_tile"])
+
+                if eval_metrics["mean_score"] > self.best_eval_score:
+                    self.best_eval_score = eval_metrics["mean_score"]
+                    best_path = os.path.join(self.config.checkpoint_dir, "checkpoint_best.pt")
+                    self.agent.save_checkpoint(
+                        best_path,
+                        metadata={
+                            "episode": ep,
+                            "eval_mean_score": self.best_eval_score,
+                            "eval_max_tile": eval_metrics["max_tile"],
+                            "afterstate": True,
+                            "model_mode": "afterstate",
+                        },
+                    )
+
+            if ep % self.config.save_latest_freq == 0:
+                latest_path = os.path.join(self.config.checkpoint_dir, "checkpoint_latest.pt")
+                self.agent.save_checkpoint(
+                    latest_path,
+                    metadata={
+                        "episode": ep,
+                        "steps": self.agent.total_steps,
+                        "afterstate": True,
+                        "model_mode": "afterstate",
+                    },
+                )
+
+        if pbar is not None:
+            pbar.close()
+
+        return self.history
+
     def train(self, max_episodes: Optional[int] = None) -> Dict[str, Any]:
-        """Run complete DDQN training loop in vectorized or single-env mode.
+        """Run complete DDQN or Afterstate training loop.
 
         Args:
             max_episodes: Optional episode override for testing.
@@ -516,7 +705,9 @@ class Trainer:
         self.warmup()
         self.start_time = time.time()
 
-        if isinstance(self.env, VectorizedGame2048Env):
+        if self.config.train_afterstate:
+            history = self._train_afterstate(total_episodes)
+        elif isinstance(self.env, VectorizedGame2048Env):
             history = self._train_vectorized(total_episodes)
         else:
             history = self._train_single(total_episodes)

@@ -109,6 +109,7 @@ class ExpectimaxSearcher:
         use_snake_heuristic: bool = True,
         alpha_snake: float = 0.5,
         beta_corner: float = 1.0,
+        use_afterstate_net: bool = False,
     ) -> None:
         """Initialize searcher with model and search configuration.
 
@@ -126,6 +127,7 @@ class ExpectimaxSearcher:
             use_snake_heuristic: Whether to blend topological snake monotonicity and corner lock shield.
             alpha_snake: Weight for snake monotonicity score (default 0.5).
             beta_corner: Weight for corner dislodgement penalty (default 1.0).
+            use_afterstate_net: Whether to query scalar V(s_after) head directly instead of max_a Q(s, a).
         """
         self.model = model
         self.device = device or get_device(prefer_gpu=True)
@@ -139,6 +141,8 @@ class ExpectimaxSearcher:
         self.use_snake_heuristic = use_snake_heuristic
         self.alpha_snake = alpha_snake
         self.beta_corner = beta_corner
+        # Auto-detect afterstate mode if configured on model
+        self.use_afterstate_net = use_afterstate_net or getattr(model, "is_afterstate", False)
         self.tt: Dict[int, float] = {}
         self.core = Game2048Core()
 
@@ -155,6 +159,7 @@ class ExpectimaxSearcher:
         adaptive_depth: Optional[bool] = None,
         apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
+        use_afterstate_net: Optional[bool] = None,
     ) -> int:
         """Select best action using lookahead search.
 
@@ -166,6 +171,7 @@ class ExpectimaxSearcher:
             adaptive_depth: Optional adaptive depth toggle overriding instance default.
             apex_mode: Optional apex mode toggle overriding instance default.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance default.
+            use_afterstate_net: Optional afterstate value network toggle overriding instance default.
 
         Returns:
             Selected integer action in {0, 1, 2, 3}.
@@ -178,6 +184,7 @@ class ExpectimaxSearcher:
             adaptive_depth=adaptive_depth,
             apex_mode=apex_mode,
             use_snake_heuristic=use_snake_heuristic,
+            use_afterstate_net=use_afterstate_net,
         )
         return best_action
 
@@ -190,6 +197,7 @@ class ExpectimaxSearcher:
         adaptive_depth: Optional[bool] = None,
         apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
+        use_afterstate_net: Optional[bool] = None,
     ) -> Tuple[int, Dict[int, float]]:
         """Perform Expectimax search from current board state.
 
@@ -201,6 +209,7 @@ class ExpectimaxSearcher:
             adaptive_depth: Optional adaptive depth toggle overriding instance setting.
             apex_mode: Optional apex mode toggle overriding instance setting.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance setting.
+            use_afterstate_net: Optional afterstate value net toggle overriding instance setting.
 
         Returns:
             Tuple of (best_action, q_values_dict).
@@ -222,6 +231,7 @@ class ExpectimaxSearcher:
 
         d4_active = self.use_d4_symmetry if use_d4_symmetry is None else use_d4_symmetry
         snake_active = self.use_snake_heuristic if use_snake_heuristic is None else use_snake_heuristic
+        afterstate_active = self.use_afterstate_net if use_afterstate_net is None else use_afterstate_net
 
         # Prune cache between moves if maximum capacity is exceeded
         if len(self.tt) > self.tt_max_size:
@@ -242,6 +252,9 @@ class ExpectimaxSearcher:
             return only_act, {a: (0.0 if a == only_act else -1e9) for a in range(4)}
 
         if d <= 0:
+            if afterstate_active:
+                # With afterstate value network V(s_after), greedy action selection is 1-ply search: argmax_a [r + gamma * V(s_after)]
+                return self._search_depth_1(bb, legal_actions, use_d4=d4_active, use_snake=snake_active)
             if np_board is None:
                 np_board = Bitboard2048.to_array(bb)
             return self._search_greedy(np_board, mask, use_d4=d4_active)
@@ -1035,23 +1048,34 @@ class ExpectimaxSearcher:
                 device_type=self.device.type,
                 enabled=(self.device.type == "cuda"),
             ):
-                if d4_active:
-                    batch_d4 = generate_d4_tensors(obs_t)
-                    batch_masks = generate_d4_masks(masks_t)
-
-                    q_vals = self.model(batch_d4, action_mask=batch_masks)
-                    q_d4 = q_vals.view(8, n, 4)
-                    # Symmetrized value: mean of maximum legal Q-values across 8 orientations
-                    v_k = q_d4.max(dim=-1).values  # (8, n)
-                    v_sym = v_k.mean(dim=0)  # (n,)
-                    v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+                if self.use_afterstate_net:
+                    if d4_active:
+                        batch_d4 = generate_d4_tensors(obs_t)
+                        v_d4 = self.model.forward_value(batch_d4)  # (8 * n,)
+                        v_k = v_d4.view(8, n)
+                        v_sym = v_k.mean(dim=0)  # (n,)
+                        v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+                    else:
+                        v_raw = self.model.forward_value(obs_t)  # (n,)
+                        v_vals = torch.where(has_legal, v_raw, torch.zeros_like(v_raw))
                 else:
-                    q_vals = self.model(obs_t, action_mask=masks_t)
-                    v_vals = torch.where(
-                        has_legal,
-                        q_vals.max(dim=-1).values,
-                        torch.zeros_like(q_vals[:, 0]),
-                    )
+                    if d4_active:
+                        batch_d4 = generate_d4_tensors(obs_t)
+                        batch_masks = generate_d4_masks(masks_t)
+
+                        q_vals = self.model(batch_d4, action_mask=batch_masks)
+                        q_d4 = q_vals.view(8, n, 4)
+                        # Symmetrized value: mean of maximum legal Q-values across 8 orientations
+                        v_k = q_d4.max(dim=-1).values  # (8, n)
+                        v_sym = v_k.mean(dim=0)  # (n,)
+                        v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+                    else:
+                        q_vals = self.model(obs_t, action_mask=masks_t)
+                        v_vals = torch.where(
+                            has_legal,
+                            q_vals.max(dim=-1).values,
+                            torch.zeros_like(q_vals[:, 0]),
+                        )
 
             v_np = v_vals.float().cpu().numpy()
 
