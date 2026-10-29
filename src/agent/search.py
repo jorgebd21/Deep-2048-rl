@@ -113,6 +113,7 @@ class ExpectimaxSearcher:
         use_afterstate_net: bool = False,
         use_ntuple: bool = False,
         ntuple_net: Optional[NTupleNetwork] = None,
+        w_ntuple: float = 0.15,
         use_smoothness: bool = False,
         w_smooth: float = 0.1,
         w_trap: float = 5.0,
@@ -138,6 +139,7 @@ class ExpectimaxSearcher:
             use_afterstate_net: Whether to query scalar V(s_after) head directly instead of max_a Q(s, a).
             use_ntuple: Whether to enable microsecond SOTA N-Tuple leaf evaluation.
             ntuple_net: Optional NTupleNetwork instance (instantiated with defaults if None).
+            w_ntuple: Weight multiplier for N-Tuple leaf value blending (default 0.15).
             use_smoothness: Whether to apply Manhattan smoothness and trapped low-tier wedge shield.
             w_smooth: Weight multiplier for Manhattan smoothness S_smooth(B).
             w_trap: Weight multiplier for trapped tile penalty P_trapped(B).
@@ -162,6 +164,7 @@ class ExpectimaxSearcher:
         )
         self.use_ntuple = use_ntuple
         self.ntuple_net = ntuple_net
+        self.w_ntuple = float(w_ntuple)
         if self.use_ntuple and self.ntuple_net is None:
             self.ntuple_net = NTupleNetwork()
         self.use_smoothness = use_smoothness
@@ -272,6 +275,13 @@ class ExpectimaxSearcher:
             List of survived action indices.
         """
         if len(legal_actions) <= 1:
+            return list(legal_actions)
+
+        # Protected Policy Pruning: strictly disabled in danger / critical endgames
+        # (empty_cells <= 4 or max_tile >= 2048). Evaluate all legal moves.
+        num_empty = Bitboard2048.count_empty_cells(bb)
+        max_rank = max((bb >> (4 * i)) & 0xF for i in range(16))
+        if num_empty <= 4 or max_rank >= 11:
             return list(legal_actions)
 
         cutoff = self.policy_prune_tau if tau is None else tau
@@ -1357,9 +1367,12 @@ class ExpectimaxSearcher:
             snake_val = np.zeros(n, dtype=np.float32)
 
         has_legal_np = masks_np.any(axis=-1)
+        # Scaled blended N-Tuple evaluation: if model is active, weight with w_ntuple;
+        # if pure N-Tuple (model is None), retain unscaled magnitude.
+        w_nt = self.w_ntuple if (self.model is not None) else 1.0
         v_final = np.where(
             has_legal_np,
-            v_np + v_ntuple + geom_val + snake_val,
+            v_np + w_nt * v_ntuple + geom_val + snake_val,
             0.0,
         )
         return v_final.astype(np.float32)
@@ -1381,6 +1394,7 @@ def expectimax_search(
     use_afterstate_net: bool = False,
     use_ntuple: bool = False,
     ntuple_net: Optional[NTupleNetwork] = None,
+    w_ntuple: float = 0.15,
     use_smoothness: bool = False,
     w_smooth: float = 0.1,
     w_trap: float = 5.0,
@@ -1403,6 +1417,7 @@ def expectimax_search(
         use_afterstate_net=use_afterstate_net,
         use_ntuple=use_ntuple,
         ntuple_net=ntuple_net,
+        w_ntuple=w_ntuple,
         use_smoothness=use_smoothness,
         w_smooth=w_smooth,
         w_trap=w_trap,

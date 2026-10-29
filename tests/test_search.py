@@ -499,3 +499,92 @@ class TestExpectimaxSearcher:
 
         best_act = searcher.select_action(arr)
         assert 0 <= best_act <= 3
+
+    def test_protected_policy_pruning_in_danger(self, mock_model: nn.Module) -> None:
+        """Protected policy pruning is strictly disabled when empty <= 4 or max_tile >= 2048."""
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_policy_pruning=True,
+            policy_prune_tau=0.40,
+        )
+
+        # Case 1: Board in danger due to tight empty cells (<= 4 empty)
+        tight_arr = np.array([
+            [2, 4, 8, 16],
+            [32, 64, 128, 256],
+            [512, 1024, 2, 4],
+            [8, 16, 32, 0],
+        ], dtype=np.int64)  # 1 empty cell, max_tile=1024
+        bb_tight = Bitboard2048.from_array(tight_arr)
+        legal = [0, 1, 2, 3]
+
+        # Must not prune any action because empty <= 4
+        survivors_tight = searcher._prune_actions_with_policy(bb_tight, legal, tau=0.99)
+        assert len(survivors_tight) == len(legal)
+
+        # Case 2: Board with 2048+ tile (max_tile >= 2048) even with many empty cells
+        big_tile_arr = np.array([
+            [2048, 4, 0, 0],
+            [8, 16, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)  # 12 empty cells, but max_tile=2048
+        bb_big = Bitboard2048.from_array(big_tile_arr)
+        survivors_big = searcher._prune_actions_with_policy(bb_big, legal, tau=0.99)
+        assert len(survivors_big) == len(legal)
+
+        # Case 3: Safe early/mid game board (empty > 4 and max_tile < 2048)
+        safe_arr = np.array([
+            [2, 4, 8, 16],
+            [32, 64, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)  # 10 empty cells, max_tile=64
+        bb_safe = Bitboard2048.from_array(safe_arr)
+
+        # With a very high tau (e.g. 0.90), low probability actions must be pruned down
+        survivors_safe = searcher._prune_actions_with_policy(bb_safe, legal, tau=0.40)
+        assert len(survivors_safe) < len(legal)
+        assert len(survivors_safe) >= 1
+
+    def test_calibrated_w_ntuple_leaf_blending(self, mock_model: nn.Module) -> None:
+        """w_ntuple scales and calibrates N-Tuple network contributions to V_leaf."""
+        from src.models.ntuple import NTupleNetwork
+
+        ntuple = NTupleNetwork(init_mode="normal")
+        arr = np.array([
+            [4, 8, 16, 32],
+            [64, 128, 256, 512],
+            [2, 4, 8, 16],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(arr)
+
+        searcher_01 = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_ntuple=True,
+            ntuple_net=ntuple,
+            w_ntuple=0.10,
+            use_smoothness=False,
+            use_snake_heuristic=False,
+        )
+        searcher_05 = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_ntuple=True,
+            ntuple_net=ntuple,
+            w_ntuple=0.50,
+            use_smoothness=False,
+            use_snake_heuristic=False,
+        )
+
+        v_01 = searcher_01._batch_evaluate_boards([bb])[0]
+        v_05 = searcher_05._batch_evaluate_boards([bb])[0]
+        v_ntuple_raw = ntuple.evaluate_bitboard(bb)
+
+        # Difference between evaluations must be exactly (0.50 - 0.10) * v_ntuple_raw
+        diff = v_05 - v_01
+        expected_diff = 0.40 * v_ntuple_raw
+        assert np.isclose(diff, expected_diff, atol=1e-4)

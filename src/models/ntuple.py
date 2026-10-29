@@ -265,6 +265,71 @@ class NTupleNetwork:
                     totals += tbl[idx]
         return totals
 
+    def update_from_delta(
+        self,
+        s_after: int,
+        td_error: float,
+        alpha: Optional[float] = None,
+        scale_by_num_tuples: bool = True,
+    ) -> None:
+        """Apply TD update directly to active tuple tables from a precomputed TD error delta.
+
+        Args:
+            s_after: Current afterstate bitboard integer.
+            td_error: Precomputed scalar TD error delta = target - V(s_after).
+            alpha: Optional learning rate overriding self.alpha.
+            scale_by_num_tuples: If True, divides learning rate by total active
+                symmetries (e.g. 24) to keep total value update calibrated to alpha * delta.
+        """
+        lr = self.alpha if alpha is None else float(alpha)
+        total_syms = sum(len(syms) for syms in self.sym_tuples)
+        step = (lr / total_syms * td_error) if scale_by_num_tuples else (lr * td_error)
+
+        s_after_int = int(s_after)
+        r = (
+            s_after_int & 0xF,
+            (s_after_int >> 4) & 0xF,
+            (s_after_int >> 8) & 0xF,
+            (s_after_int >> 12) & 0xF,
+            (s_after_int >> 16) & 0xF,
+            (s_after_int >> 20) & 0xF,
+            (s_after_int >> 24) & 0xF,
+            (s_after_int >> 28) & 0xF,
+            (s_after_int >> 32) & 0xF,
+            (s_after_int >> 36) & 0xF,
+            (s_after_int >> 40) & 0xF,
+            (s_after_int >> 44) & 0xF,
+            (s_after_int >> 48) & 0xF,
+            (s_after_int >> 52) & 0xF,
+            (s_after_int >> 56) & 0xF,
+            (s_after_int >> 60) & 0xF,
+        )
+
+        for pat_idx, sym_list in enumerate(self.sym_tuples):
+            tbl = self.tables[pat_idx]
+            k = len(self.patterns[pat_idx])
+            if k == 4:
+                for c0, c1, c2, c3 in sym_list:
+                    idx = r[c0] | (r[c1] << 4) | (r[c2] << 8) | (r[c3] << 12)
+                    tbl[idx] += step
+            elif k == 6:
+                for c0, c1, c2, c3, c4, c5 in sym_list:
+                    idx = (
+                        r[c0]
+                        | (r[c1] << 4)
+                        | (r[c2] << 8)
+                        | (r[c3] << 12)
+                        | (r[c4] << 16)
+                        | (r[c5] << 20)
+                    )
+                    tbl[idx] += step
+            else:
+                for sym_p in sym_list:
+                    idx = 0
+                    for j, c in enumerate(sym_p):
+                        idx |= (r[c] << (4 * j))
+                    tbl[idx] += step
+
     def update(
         self,
         s_after: int,
@@ -393,9 +458,9 @@ class NTupleNetwork:
         """Save N-Tuple lookup tables to compressed .npz archive."""
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         save_dict = {f"table_{i}": t for i, t in enumerate(self.tables)}
-        save_dict["alpha"] = np.array(self.alpha, dtype=np.float32)
-        save_dict["gamma"] = np.array(self.gamma, dtype=np.float32)
-        save_dict["lambd"] = np.array(self.lambd, dtype=np.float32)
+        save_dict["alpha"] = np.array(self.alpha, dtype=np.float64)
+        save_dict["gamma"] = np.array(self.gamma, dtype=np.float64)
+        save_dict["lambd"] = np.array(self.lambd, dtype=np.float64)
         np.savez_compressed(filepath, **save_dict)
 
     def load(self, filepath: str) -> None:

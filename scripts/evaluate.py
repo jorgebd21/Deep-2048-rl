@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-afterstate-net", action="store_true", default=False, help="Use scalar afterstate value head V(s_after) for leaf evaluation")
     parser.add_argument("--use-ntuple", action="store_true", default=False, help="Enable SOTA N-Tuple Network value evaluation")
     parser.add_argument("--ntuple-path", type=str, default=None, help="Path to pretrained N-Tuple .npz weights")
+    parser.add_argument("--w-ntuple", type=float, default=0.15, help="Weight multiplier for N-Tuple leaf value blending")
     parser.add_argument("--use-smoothness", action="store_true", default=False, help="Enable bitwise Manhattan smoothness and trapped-tile shield")
     parser.add_argument("--w-smooth", type=float, default=0.1, help="Weight multiplier for Manhattan smoothness")
     parser.add_argument("--w-trap", type=float, default=5.0, help="Weight multiplier for trapped tile penalty")
@@ -65,6 +66,7 @@ def evaluate_agent(
     use_afterstate_net: bool = False,
     use_ntuple: bool = False,
     ntuple_net: Optional[NTupleNetwork] = None,
+    w_ntuple: float = 0.15,
     use_smoothness: bool = False,
     w_smooth: float = 0.1,
     w_trap: float = 5.0,
@@ -102,6 +104,7 @@ def evaluate_agent(
             use_afterstate_net=use_afterstate_net,
             use_ntuple=use_ntuple,
             ntuple_net=ntuple_net,
+            w_ntuple=w_ntuple,
             use_smoothness=use_smoothness,
             w_smooth=w_smooth,
             w_trap=w_trap,
@@ -312,6 +315,7 @@ def main() -> None:
         use_afterstate_net=use_afterstate_net,
         use_ntuple=args.use_ntuple,
         ntuple_net=ntuple_net,
+        w_ntuple=args.w_ntuple,
         use_smoothness=args.use_smoothness,
         w_smooth=args.w_smooth,
         w_trap=args.w_trap,
@@ -352,7 +356,7 @@ def main() -> None:
     print(f"  Lookahead Depth     : {depth_str}")
     print(f"  D4 Symmetrization   : {'Enabled' if results['use_d4_symmetry'] else 'Disabled'}")
     print(f"  Snake Shield        : {'Enabled (alpha={:.2f}, beta={:.2f})'.format(results['alpha_snake'], results['beta_corner']) if results['use_snake_heuristic'] else 'Disabled'}")
-    print(f"  N-Tuple Evaluation  : {'Enabled' if results['use_ntuple'] else 'Disabled'}")
+    print(f"  N-Tuple Evaluation  : {'Enabled (w_ntuple={:.2f})'.format(args.w_ntuple) if results['use_ntuple'] else 'Disabled'}")
     print(f"  Smoothness Shield   : {'Enabled (w_smooth={:.2f}, w_trap={:.2f})'.format(results['w_smooth'], results['w_trap']) if results['use_smoothness'] else 'Disabled'}")
     print(f"  Policy Pruning      : {'Enabled (tau={:.3f})'.format(results['policy_prune_tau']) if results['use_policy_pruning'] else 'Disabled'}")
     print(f"  Elapsed Time        : {results['elapsed_seconds']:.2f} s")

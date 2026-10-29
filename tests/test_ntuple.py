@@ -175,3 +175,59 @@ class TestNTupleNetworkArchitecture:
             val2 = net2.evaluate_bitboard(bb)
 
             assert np.isclose(val1, val2, atol=1e-6)
+
+    def test_update_from_delta_shifts_weights_towards_target(self) -> None:
+        """update_from_delta shifts tuple weights in the direction of the target."""
+        net = NTupleNetwork(init_mode="zeros")
+        bb = 0x123456789ABCDEF0
+
+        assert net.evaluate_bitboard(bb) == 0.0
+
+        # Positive delta must increase evaluation
+        net.update_from_delta(bb, td_error=10.0, alpha=0.05, scale_by_num_tuples=True)
+        v1 = net.evaluate_bitboard(bb)
+        assert v1 > 0.0
+        assert np.isclose(v1, 10.0 * 0.05, atol=1e-4)
+
+        # Negative delta must decrease evaluation
+        net.update_from_delta(bb, td_error=-5.0, alpha=0.05, scale_by_num_tuples=True)
+        v2 = net.evaluate_bitboard(bb)
+        assert v2 < v1
+
+    def test_exact_bit_level_weight_parity_save_load(self) -> None:
+        """Loading and saving ntuple_best.npz maintains exact bit-level weight parity."""
+        net = NTupleNetwork(init_mode="normal")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "ntuple_best.npz")
+            net.save(save_path)
+
+            loaded_net = NTupleNetwork(init_mode="zeros")
+            loaded_net.load(save_path)
+
+            assert len(net.tables) == len(loaded_net.tables)
+            for t_orig, t_load in zip(net.tables, loaded_net.tables):
+                assert np.array_equal(t_orig, t_load), "Tables do not match at exact bit-level parity"
+            assert np.isclose(net.alpha, loaded_net.alpha)
+            assert np.isclose(net.gamma, loaded_net.gamma)
+
+    def test_train_ntuple_pipeline_execution(self) -> None:
+        """Fast training loop runs, decays learning rate, and saves checkpoints."""
+        from src.training.train_ntuple import train_ntuple
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "ntuple_best.npz")
+            net, metrics = train_ntuple(
+                episodes=30,
+                alpha_init=0.05,
+                alpha_min=0.005,
+                gamma=0.99,
+                save_path=save_path,
+                eval_every=10,
+                seed=42,
+            )
+            assert os.path.exists(save_path)
+            assert metrics["episodes"] == 30
+            assert metrics["total_steps"] > 0
+            assert len(metrics["scores_history"]) == 30
+            # Ensure weights were updated
+            assert any(np.any(t != 0.0) for t in net.tables)
