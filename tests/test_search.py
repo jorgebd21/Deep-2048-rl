@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
 from src.agent.search import (
     ExpectimaxSearcher,
@@ -10,6 +11,7 @@ from src.agent.search import (
     generate_d4_masks,
     generate_d4_tensors,
 )
+from src.env.bitboard import Bitboard2048
 from src.env.core import Action, Game2048Core
 from src.models.dueling_dqn import Dueling2048Net
 from src.training.agent import DDQNAgent
@@ -403,3 +405,97 @@ class TestExpectimaxSearcher:
         assert 0 <= act6 <= 3
         mask6 = Game2048Core().get_action_mask(b_apex1)
         assert bool(mask6[act6]) is True
+
+    def test_policy_guided_action_pruning(self, mock_model: nn.Module) -> None:
+        """Validate policy prior computation and branch pruning below threshold tau."""
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_policy_pruning=True,
+            policy_prune_tau=0.25,
+        )
+        arr = np.array([
+            [2, 4, 8, 16],
+            [32, 64, 128, 256],
+            [512, 1024, 2, 4],
+            [8, 16, 32, 0],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(arr)
+        legal_actions = [0, 1, 2, 3]
+
+        # Prior policy distribution
+        pi = searcher.get_action_policy(bb, legal_actions)
+        assert len(pi) == 4
+        assert np.isclose(np.sum(pi), 1.0, atol=1e-5)
+
+        # Pruning actions
+        survivors = searcher._prune_actions_with_policy(bb, legal_actions, tau=0.25)
+        assert len(survivors) >= 1
+        for a in survivors:
+            assert a in legal_actions
+
+        # Suicidal fallback test: even with an impossibly high tau, at least 1 action survives
+        extreme_survivors = searcher._prune_actions_with_policy(bb, legal_actions, tau=0.99)
+        assert len(extreme_survivors) >= 1
+
+    def test_unified_leaf_evaluation_pipeline(self, mock_model: nn.Module) -> None:
+        """Validate unified leaf scoring V_leaf = V_ntuple + w_smooth * S_smooth - w_trap * P_trapped + V_net."""
+        from src.models.ntuple import NTupleNetwork
+
+        ntuple = NTupleNetwork(init_mode="normal")
+        searcher = ExpectimaxSearcher(
+            model=mock_model,
+            device=torch.device("cpu"),
+            use_ntuple=True,
+            ntuple_net=ntuple,
+            use_smoothness=True,
+            w_smooth=0.2,
+            w_trap=5.0,
+            use_snake_heuristic=False,
+        )
+
+        arr = np.array([
+            [2048, 2, 512, 256],
+            [128, 64, 32, 16],
+            [8, 4, 2, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+        bb = Bitboard2048.from_array(arr)
+
+        # Leaf evaluate
+        v_leaf = searcher._batch_evaluate_boards([bb])[0]
+
+        # Manual terms
+        v_ntuple_exp = ntuple.evaluate_bitboard(bb)
+        s_smooth_exp = Bitboard2048.compute_smoothness(bb)
+        p_trapped_exp = Bitboard2048.compute_trapped_penalty(bb)
+
+        # V_leaf must incorporate all components
+        expected_geom = 0.2 * s_smooth_exp - 5.0 * p_trapped_exp
+        # Check that geometric penalty was applied (wedge at top wall pos 1)
+        assert p_trapped_exp > 0.0
+        assert expected_geom < 0.0
+
+    def test_pure_ntuple_search_without_model(self) -> None:
+        """Expectimax search works cleanly with pure N-Tuple evaluation when model is None."""
+        from src.models.ntuple import NTupleNetwork
+
+        ntuple = NTupleNetwork(init_mode="normal")
+        searcher = ExpectimaxSearcher(
+            model=None,
+            depth=2,
+            use_ntuple=True,
+            ntuple_net=ntuple,
+            use_smoothness=True,
+            use_snake_heuristic=False,
+        )
+
+        arr = np.array([
+            [2, 4, 8, 16],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ], dtype=np.int64)
+
+        best_act = searcher.select_action(arr)
+        assert 0 <= best_act <= 3

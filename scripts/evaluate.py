@@ -15,6 +15,7 @@ import torch
 from src.agent.search import ExpectimaxSearcher
 from src.env.wrapper import Game2048Env
 from src.models.dueling_dqn import Dueling2048Net
+from src.models.ntuple import NTupleNetwork
 from src.utils.cuda_utils import get_device, setup_ampere_tf32
 
 
@@ -36,13 +37,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha-snake", type=float, default=0.5, help="Weight for snake monotonicity score")
     parser.add_argument("--beta-corner", type=float, default=1.0, help="Weight for corner dislodgement penalty")
     parser.add_argument("--use-afterstate-net", action="store_true", default=False, help="Use scalar afterstate value head V(s_after) for leaf evaluation")
+    parser.add_argument("--use-ntuple", action="store_true", default=False, help="Enable SOTA N-Tuple Network value evaluation")
+    parser.add_argument("--ntuple-path", type=str, default=None, help="Path to pretrained N-Tuple .npz weights")
+    parser.add_argument("--use-smoothness", action="store_true", default=False, help="Enable bitwise Manhattan smoothness and trapped-tile shield")
+    parser.add_argument("--w-smooth", type=float, default=0.1, help="Weight multiplier for Manhattan smoothness")
+    parser.add_argument("--w-trap", type=float, default=5.0, help="Weight multiplier for trapped tile penalty")
+    parser.add_argument("--use-policy-pruning", action="store_true", default=False, help="Enable policy-guided action pruning at shallow plies")
+    parser.add_argument("--policy-prune-tau", type=float, default=0.03, help="Cutoff threshold for action policy prior pruning")
     parser.add_argument("--max-empty-samples", type=int, default=None, help="Max empty cells to sample per chance node (default: evaluate all empty cells)")
     parser.add_argument("--save-json", type=str, default=None, help="Save evaluation metrics to JSON file")
     return parser.parse_args()
 
 
 def evaluate_agent(
-    model: Dueling2048Net,
+    model: Optional[Dueling2048Net] = None,
     episodes: int = 100,
     device: Optional[torch.device] = None,
     seed: int = 42,
@@ -55,14 +63,31 @@ def evaluate_agent(
     alpha_snake: float = 0.5,
     beta_corner: float = 1.0,
     use_afterstate_net: bool = False,
+    use_ntuple: bool = False,
+    ntuple_net: Optional[NTupleNetwork] = None,
+    use_smoothness: bool = False,
+    w_smooth: float = 0.1,
+    w_trap: float = 5.0,
+    use_policy_pruning: bool = False,
+    policy_prune_tau: float = 0.03,
 ) -> Dict[str, Any]:
     """Execute deterministic evaluation runs and compute aggregate performance statistics."""
     dev = device or torch.device("cpu")
-    model.eval()
+    if model is not None:
+        model.eval()
     env = Game2048Env()
 
     searcher: Optional[ExpectimaxSearcher] = None
-    if lookahead_depth > 0 or adaptive_depth or apex_mode or use_d4_symmetry or use_afterstate_net:
+    if (
+        lookahead_depth > 0
+        or adaptive_depth
+        or apex_mode
+        or use_d4_symmetry
+        or use_afterstate_net
+        or use_ntuple
+        or use_smoothness
+        or use_policy_pruning
+    ):
         searcher = ExpectimaxSearcher(
             model=model,
             device=dev,
@@ -75,6 +100,13 @@ def evaluate_agent(
             alpha_snake=alpha_snake,
             beta_corner=beta_corner,
             use_afterstate_net=use_afterstate_net,
+            use_ntuple=use_ntuple,
+            ntuple_net=ntuple_net,
+            use_smoothness=use_smoothness,
+            w_smooth=w_smooth,
+            w_trap=w_trap,
+            use_policy_pruning=use_policy_pruning,
+            policy_prune_tau=policy_prune_tau,
         )
 
     scores: List[float] = []
@@ -83,14 +115,18 @@ def evaluate_agent(
 
     d4_str = " + D4 Symmetry" if use_d4_symmetry else ""
     snake_str = " + Snake Shield" if use_snake_heuristic else ""
+    ntuple_str = " + N-Tuple" if use_ntuple else ""
+    smooth_str = " + Smoothness Shield" if use_smoothness else ""
+    prune_str = " + Policy Pruning" if use_policy_pruning else ""
+
     if apex_mode:
-        search_mode_str = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_str}{snake_str}"
+        search_mode_str = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_str}{snake_str}{ntuple_str}{smooth_str}{prune_str}"
     elif adaptive_depth:
-        search_mode_str = f"Adaptive Depth Expectimax{d4_str}{snake_str}"
+        search_mode_str = f"Adaptive Depth Expectimax{d4_str}{snake_str}{ntuple_str}{smooth_str}{prune_str}"
     elif lookahead_depth > 0:
-        search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}{snake_str}"
+        search_mode_str = f"{lookahead_depth}-ply Expectimax{d4_str}{snake_str}{ntuple_str}{smooth_str}{prune_str}"
     else:
-        search_mode_str = f"pure greedy (0-ply{d4_str})"
+        search_mode_str = f"pure greedy (0-ply{d4_str}{ntuple_str}{smooth_str})"
     print(f"\nRunning {episodes} evaluation episodes with {search_mode_str}...", flush=True)
     start_time = time.time()
 
@@ -153,6 +189,12 @@ def evaluate_agent(
         "use_snake_heuristic": use_snake_heuristic,
         "alpha_snake": alpha_snake,
         "beta_corner": beta_corner,
+        "use_ntuple": use_ntuple,
+        "use_smoothness": use_smoothness,
+        "w_smooth": w_smooth,
+        "w_trap": w_trap,
+        "use_policy_pruning": use_policy_pruning,
+        "policy_prune_tau": policy_prune_tau,
         "elapsed_seconds": round(elapsed, 2),
         "mean_score": float(np.mean(scores_arr)),
         "std_score": float(np.std(scores_arr)),
@@ -245,6 +287,15 @@ def main() -> None:
         model.eval()
         print("No checkpoint specified. Evaluating untrained baseline model.")
 
+    ntuple_net = None
+    if args.use_ntuple:
+        ntuple_net = NTupleNetwork()
+        if args.ntuple_path and os.path.exists(args.ntuple_path):
+            ntuple_net.load(args.ntuple_path)
+            print(f"Loaded N-Tuple weights successfully from {args.ntuple_path}")
+        else:
+            print("Initialized N-Tuple Network with canonical D4 configurations.")
+
     results = evaluate_agent(
         model=model,
         episodes=args.episodes,
@@ -259,6 +310,13 @@ def main() -> None:
         alpha_snake=args.alpha_snake,
         beta_corner=args.beta_corner,
         use_afterstate_net=use_afterstate_net,
+        use_ntuple=args.use_ntuple,
+        ntuple_net=ntuple_net,
+        use_smoothness=args.use_smoothness,
+        w_smooth=args.w_smooth,
+        w_trap=args.w_trap,
+        use_policy_pruning=args.use_policy_pruning,
+        policy_prune_tau=args.policy_prune_tau,
     )
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -269,14 +327,18 @@ def main() -> None:
 
     d4_label = " + D4 Symmetry" if args.use_d4_symmetry else ""
     snake_label = " + Snake Shield" if args.use_snake_heuristic else ""
+    ntuple_label = " + N-Tuple" if args.use_ntuple else ""
+    smooth_label = " + Smoothness Shield" if args.use_smoothness else ""
+    prune_label = " + Policy Pruning" if args.use_policy_pruning else ""
+
     if args.apex_mode:
-        search_label = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_label}{snake_label}"
+        search_label = f"Apex Adaptive Depth (2..6 ply) Expectimax{d4_label}{snake_label}{ntuple_label}{smooth_label}{prune_label}"
     elif args.adaptive_depth:
-        search_label = f"Adaptive Depth Expectimax{d4_label}{snake_label}"
+        search_label = f"Adaptive Depth Expectimax{d4_label}{snake_label}{ntuple_label}{smooth_label}{prune_label}"
     elif args.lookahead_depth > 0:
-        search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}{snake_label}"
+        search_label = f"{args.lookahead_depth}-ply Expectimax{d4_label}{snake_label}{ntuple_label}{smooth_label}{prune_label}"
     else:
-        search_label = f"Pure Greedy (0-ply{d4_label})"
+        search_label = f"Pure Greedy (0-ply{d4_label}{ntuple_label}{smooth_label})"
     print("\n" + "=" * 65)
     print(f" MONTE CARLO EVALUATION REPORT ({search_label})")
     print("=" * 65)
@@ -290,6 +352,9 @@ def main() -> None:
     print(f"  Lookahead Depth     : {depth_str}")
     print(f"  D4 Symmetrization   : {'Enabled' if results['use_d4_symmetry'] else 'Disabled'}")
     print(f"  Snake Shield        : {'Enabled (alpha={:.2f}, beta={:.2f})'.format(results['alpha_snake'], results['beta_corner']) if results['use_snake_heuristic'] else 'Disabled'}")
+    print(f"  N-Tuple Evaluation  : {'Enabled' if results['use_ntuple'] else 'Disabled'}")
+    print(f"  Smoothness Shield   : {'Enabled (w_smooth={:.2f}, w_trap={:.2f})'.format(results['w_smooth'], results['w_trap']) if results['use_smoothness'] else 'Disabled'}")
+    print(f"  Policy Pruning      : {'Enabled (tau={:.3f})'.format(results['policy_prune_tau']) if results['use_policy_pruning'] else 'Disabled'}")
     print(f"  Elapsed Time        : {results['elapsed_seconds']:.2f} s")
     print(f"  Mean Score          : {results['mean_score']:.1f} +/- {results['std_score']:.1f}")
     print(f"  Median Score        : {results['median_score']:.1f}")

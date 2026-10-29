@@ -74,6 +74,45 @@ def _build_luts() -> Tuple[
 ) = _build_luts()
 
 
+def _build_smoothness_lut() -> np.ndarray:
+    """Precompute 16-bit row directed adjacent non-empty rank difference lookup table."""
+    lut = np.zeros(65536, dtype=np.float32)
+    for R in range(65536):
+        k0 = (R >> 0) & 0xF
+        k1 = (R >> 4) & 0xF
+        k2 = (R >> 8) & 0xF
+        k3 = (R >> 12) & 0xF
+        d = 0
+        if k0 > 0 and k1 > 0:
+            d += 2 * abs(k0 - k1)
+        if k1 > 0 and k2 > 0:
+            d += 2 * abs(k1 - k2)
+        if k2 > 0 and k3 > 0:
+            d += 2 * abs(k2 - k3)
+        lut[R] = d
+    return lut
+
+
+ROW_SMOOTHNESS_TABLE = _build_smoothness_lut()
+
+# Wall wedge candidates: (center, flank1, flank2, perpendicular_interior)
+# Flanked strictly by >= 6 on outer wall and interior != center for no immediate merge
+_WALL_WEDGE_CANDIDATES = (
+    # Top wall (row 0)
+    (1, 0, 2, 5),
+    (2, 1, 3, 6),
+    # Bottom wall (row 3)
+    (13, 12, 14, 9),
+    (14, 13, 15, 10),
+    # Left wall (col 0)
+    (4, 0, 8, 5),
+    (8, 4, 12, 9),
+    # Right wall (col 3)
+    (7, 3, 11, 6),
+    (11, 7, 15, 10),
+)
+
+
 def _build_snake_weights(base: float = 2.8) -> np.ndarray:
     """Precompute the 8 Dihedral D4 snake monotonicity weight vectors with smooth decay."""
     p1 = [0, 1, 2, 3, 7, 6, 5, 4, 8, 9, 10, 11, 15, 14, 13, 12]
@@ -667,3 +706,191 @@ class Bitboard2048:
                     k = min(15, int(math.log2(val)))
                 bb |= ((k & 0xF) << (4 * (4 * r + c)))
         return bb & MASK64
+
+    @classmethod
+    def compute_smoothness(cls, bb: int, directed: bool = True) -> float:
+        """Compute bitwise Manhattan Smoothness S_smooth(B).
+
+        Measures value continuity between horizontally and vertically adjacent non-empty cells:
+            S_smooth(B) = - sum_{i, j} ( sum_{k in neighbors(i, j)} |rank(c_{i, j}) - rank(c_k)| )
+        Sign is inverted so higher values (closer to 0) represent smoother boards.
+
+        Args:
+            bb: 64-bit bitboard integer.
+            directed: If True (default), sums directed neighbor differences matching the formula.
+                If False, sums undirected adjacent pairs (half the directed sum).
+
+        Returns:
+            Negative float indicating total roughness (higher / closer to 0 is smoother).
+        """
+        bb_int = int(bb)
+        r0 = bb_int & ROW_MASK
+        r1 = (bb_int >> 16) & ROW_MASK
+        r2 = (bb_int >> 32) & ROW_MASK
+        r3 = (bb_int >> 48) & ROW_MASK
+
+        t = cls.transpose(bb_int)
+        c0 = t & ROW_MASK
+        c1 = (t >> 16) & ROW_MASK
+        c2 = (t >> 32) & ROW_MASK
+        c3 = (t >> 48) & ROW_MASK
+
+        diff = (
+            ROW_SMOOTHNESS_TABLE[r0]
+            + ROW_SMOOTHNESS_TABLE[r1]
+            + ROW_SMOOTHNESS_TABLE[r2]
+            + ROW_SMOOTHNESS_TABLE[r3]
+            + ROW_SMOOTHNESS_TABLE[c0]
+            + ROW_SMOOTHNESS_TABLE[c1]
+            + ROW_SMOOTHNESS_TABLE[c2]
+            + ROW_SMOOTHNESS_TABLE[c3]
+        )
+        if not directed:
+            diff *= 0.5
+        return -float(diff)
+
+    @classmethod
+    def compute_smoothness_batch(
+        cls,
+        bbs: Union[np.ndarray, Sequence[int]],
+        directed: bool = True,
+    ) -> np.ndarray:
+        """Vectorized computation of Manhattan smoothness for an array of 64-bit bitboards.
+
+        Args:
+            bbs: Sequence or 1D array of 64-bit bitboard integers.
+            directed: Whether to sum directed differences (default: True).
+
+        Returns:
+            1D float32 array of shape (N,) containing S_smooth(B) for each board.
+        """
+        n = len(bbs)
+        if n == 0:
+            return np.array([], dtype=np.float32)
+        bb_arr = np.asarray(bbs, dtype=np.uint64)
+        r0 = (bb_arr & np.uint64(ROW_MASK)).astype(np.int32)
+        r1 = ((bb_arr >> np.uint64(16)) & np.uint64(ROW_MASK)).astype(np.int32)
+        r2 = ((bb_arr >> np.uint64(32)) & np.uint64(ROW_MASK)).astype(np.int32)
+        r3 = ((bb_arr >> np.uint64(48)) & np.uint64(ROW_MASK)).astype(np.int32)
+
+        # Delta-swap bitwise vector transposition
+        t = (bb_arr ^ (bb_arr >> np.uint64(12))) & np.uint64(0x0000F0F00000F0F0)
+        tb = bb_arr ^ t ^ (t << np.uint64(12))
+        t2 = (tb ^ (tb >> np.uint64(24))) & np.uint64(0x00000000FF00FF00)
+        trans = tb ^ t2 ^ (t2 << np.uint64(24))
+
+        c0 = (trans & np.uint64(ROW_MASK)).astype(np.int32)
+        c1 = ((trans >> np.uint64(16)) & np.uint64(ROW_MASK)).astype(np.int32)
+        c2 = ((trans >> np.uint64(32)) & np.uint64(ROW_MASK)).astype(np.int32)
+        c3 = ((trans >> np.uint64(48)) & np.uint64(ROW_MASK)).astype(np.int32)
+
+        diffs = (
+            ROW_SMOOTHNESS_TABLE[r0]
+            + ROW_SMOOTHNESS_TABLE[r1]
+            + ROW_SMOOTHNESS_TABLE[r2]
+            + ROW_SMOOTHNESS_TABLE[r3]
+            + ROW_SMOOTHNESS_TABLE[c0]
+            + ROW_SMOOTHNESS_TABLE[c1]
+            + ROW_SMOOTHNESS_TABLE[c2]
+            + ROW_SMOOTHNESS_TABLE[c3]
+        )
+        if not directed:
+            diffs *= 0.5
+        return -diffs.astype(np.float32)
+
+    @classmethod
+    def detect_trapped_tiles(cls, bb: int) -> int:
+        """Detect low-tier tile wedges (rank 1 or 2, i.e., 2 or 4) along outer walls.
+
+        A tile wedge is strictly flanked on both sides by tiles of rank >= 6 (>= 64),
+        with no immediate merge possible perpendicular to the wall.
+
+        Args:
+            bb: 64-bit bitboard integer.
+
+        Returns:
+            Integer count of trapped low-tier wedges (0 on clean boards).
+        """
+        count = 0
+        bb_int = int(bb)
+        for center, f1, f2, interior in _WALL_WEDGE_CANDIDATES:
+            rk_c = (bb_int >> (4 * center)) & 0xF
+            if rk_c == 1 or rk_c == 2:
+                rk_f1 = (bb_int >> (4 * f1)) & 0xF
+                rk_f2 = (bb_int >> (4 * f2)) & 0xF
+                if rk_f1 >= 6 and rk_f2 >= 6:
+                    rk_int = (bb_int >> (4 * interior)) & 0xF
+                    if rk_int != rk_c:
+                        count += 1
+        return count
+
+    @classmethod
+    def compute_trapped_penalty(
+        cls,
+        bb: int,
+        penalty_per_tile: float = 1.0,
+        use_severity: bool = False,
+    ) -> float:
+        """Compute structural penalty P_trapped(B) for trapped low-tier wedges.
+
+        Args:
+            bb: 64-bit bitboard integer.
+            penalty_per_tile: Base multiplier per trapped tile.
+            use_severity: If True, scales penalty by flank rank difference.
+
+        Returns:
+            Non-negative float penalty (0.0 on clean boards).
+        """
+        penalty = 0.0
+        bb_int = int(bb)
+        for center, f1, f2, interior in _WALL_WEDGE_CANDIDATES:
+            rk_c = (bb_int >> (4 * center)) & 0xF
+            if rk_c == 1 or rk_c == 2:
+                rk_f1 = (bb_int >> (4 * f1)) & 0xF
+                rk_f2 = (bb_int >> (4 * f2)) & 0xF
+                if rk_f1 >= 6 and rk_f2 >= 6:
+                    rk_int = (bb_int >> (4 * interior)) & 0xF
+                    if rk_int != rk_c:
+                        if use_severity:
+                            penalty += penalty_per_tile * float(min(rk_f1, rk_f2) - rk_c)
+                        else:
+                            penalty += penalty_per_tile
+        return float(penalty)
+
+    @classmethod
+    def compute_trapped_penalty_batch(
+        cls,
+        bbs: Union[np.ndarray, Sequence[int]],
+        penalty_per_tile: float = 1.0,
+        use_severity: bool = False,
+    ) -> np.ndarray:
+        """Vectorized computation of trapped tile penalties for an array of bitboards.
+
+        Args:
+            bbs: Sequence or 1D array of 64-bit bitboard integers.
+            penalty_per_tile: Multiplier per trapped tile.
+            use_severity: If True, scales penalty by flank rank difference.
+
+        Returns:
+            1D float32 array of shape (N,) containing P_trapped(B).
+        """
+        n = len(bbs)
+        if n == 0:
+            return np.array([], dtype=np.float32)
+        bb_arr = np.asarray(bbs, dtype=np.uint64)
+        penalties = np.zeros(n, dtype=np.float32)
+        for center, f1, f2, interior in _WALL_WEDGE_CANDIDATES:
+            rk_c = ((bb_arr >> np.uint64(4 * center)) & np.uint64(0xF)).astype(np.int32)
+            is_low = (rk_c == 1) | (rk_c == 2)
+            rk_f1 = ((bb_arr >> np.uint64(4 * f1)) & np.uint64(0xF)).astype(np.int32)
+            rk_f2 = ((bb_arr >> np.uint64(4 * f2)) & np.uint64(0xF)).astype(np.int32)
+            is_flanked = (rk_f1 >= 6) & (rk_f2 >= 6)
+            rk_int = ((bb_arr >> np.uint64(4 * interior)) & np.uint64(0xF)).astype(np.int32)
+            no_merge = (rk_int != rk_c)
+            is_wedge = is_low & is_flanked & no_merge
+            if use_severity:
+                sev = (np.minimum(rk_f1, rk_f2) - rk_c).astype(np.float32)
+                penalties += np.where(is_wedge, penalty_per_tile * sev, 0.0)
+            else:
+                penalties += np.where(is_wedge, penalty_per_tile, 0.0)
+        return penalties

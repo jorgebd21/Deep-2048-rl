@@ -22,6 +22,7 @@ from src.env.bitboard import (
     compute_d4_structural_scores,
 )
 from src.env.wrapper import _POWER_LUT, MAX_TILE_VAL, one_hot_encode_board
+from src.models.ntuple import NTupleNetwork
 from src.utils.cuda_utils import get_device
 
 # Dihedral D4 action index permutations:
@@ -97,7 +98,7 @@ class ExpectimaxSearcher:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: Optional[nn.Module] = None,
         device: Optional[torch.device] = None,
         gamma: float = 0.99,
         depth: int = 2,
@@ -110,11 +111,18 @@ class ExpectimaxSearcher:
         alpha_snake: float = 0.5,
         beta_corner: float = 1.0,
         use_afterstate_net: bool = False,
+        use_ntuple: bool = False,
+        ntuple_net: Optional[NTupleNetwork] = None,
+        use_smoothness: bool = False,
+        w_smooth: float = 0.1,
+        w_trap: float = 5.0,
+        use_policy_pruning: bool = False,
+        policy_prune_tau: float = 0.03,
     ) -> None:
         """Initialize searcher with model and search configuration.
 
         Args:
-            model: PyTorch policy or Q-network (e.g. Dueling2048Net).
+            model: PyTorch policy or Q-network (e.g. Dueling2048Net). Optional if NTupleNetwork used alone.
             device: Compute device (defaults to GPU if available).
             gamma: Discount factor for Bellman expectation calculation.
             depth: Default search depth (0 for greedy, 1 for 1-ply, 2 for 2-ply, 3 for 3-ply, 4 for 4-ply).
@@ -128,6 +136,13 @@ class ExpectimaxSearcher:
             alpha_snake: Weight for snake monotonicity score (default 0.5).
             beta_corner: Weight for corner dislodgement penalty (default 1.0).
             use_afterstate_net: Whether to query scalar V(s_after) head directly instead of max_a Q(s, a).
+            use_ntuple: Whether to enable microsecond SOTA N-Tuple leaf evaluation.
+            ntuple_net: Optional NTupleNetwork instance (instantiated with defaults if None).
+            use_smoothness: Whether to apply Manhattan smoothness and trapped low-tier wedge shield.
+            w_smooth: Weight multiplier for Manhattan smoothness S_smooth(B).
+            w_trap: Weight multiplier for trapped tile penalty P_trapped(B).
+            use_policy_pruning: Whether to prune low-probability actions (pi(a|s) < tau) at shallow plies.
+            policy_prune_tau: Cutoff threshold for policy-guided action pruning.
         """
         self.model = model
         self.device = device or get_device(prefer_gpu=True)
@@ -142,13 +157,143 @@ class ExpectimaxSearcher:
         self.alpha_snake = alpha_snake
         self.beta_corner = beta_corner
         # Auto-detect afterstate mode if configured on model
-        self.use_afterstate_net = use_afterstate_net or getattr(model, "is_afterstate", False)
+        self.use_afterstate_net = use_afterstate_net or (
+            getattr(model, "is_afterstate", False) if model is not None else False
+        )
+        self.use_ntuple = use_ntuple
+        self.ntuple_net = ntuple_net
+        if self.use_ntuple and self.ntuple_net is None:
+            self.ntuple_net = NTupleNetwork()
+        self.use_smoothness = use_smoothness
+        self.w_smooth = float(w_smooth)
+        self.w_trap = float(w_trap)
+        self.use_policy_pruning = use_policy_pruning
+        self.policy_prune_tau = float(policy_prune_tau)
+
         self.tt: Dict[int, float] = {}
         self.core = Game2048Core()
 
     def clear_tt(self) -> None:
         """Clear all cached entries in the Transposition Table."""
         self.tt.clear()
+
+    def get_action_policy(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+    ) -> np.ndarray:
+        """Compute action policy prior distribution pi(a | s) over legal actions.
+
+        Supports dual-head policy networks, Q-networks, afterstate networks, and N-Tuple priors.
+
+        Args:
+            bb: 64-bit bitboard integer.
+            legal_actions: Sequence of legal action indices in {0, 1, 2, 3}.
+
+        Returns:
+            Normalized 1D float32 array of shape (4,) representing pi(a | s).
+        """
+        if len(legal_actions) == 0:
+            return np.zeros(4, dtype=np.float32)
+
+        # 1. Dual-Head Network: if model exposes forward_policy
+        if self.model is not None and hasattr(self.model, "forward_policy"):
+            np_board = Bitboard2048.to_array(bb)
+            obs = one_hot_encode_board(np_board)
+            obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+            with torch.inference_mode():
+                probs = self.model.forward_policy(obs_t).squeeze(0).cpu().numpy()
+            mask_arr = np.zeros(4, dtype=bool)
+            mask_arr[list(legal_actions)] = True
+            masked_probs = np.where(mask_arr, probs, 0.0)
+            sum_p = masked_probs.sum()
+            if sum_p > 1e-6:
+                return (masked_probs / sum_p).astype(np.float32)
+
+        # 2. Derive policy from Q-values or afterstate values
+        q_vals = np.full(4, -1e9, dtype=np.float32)
+        if self.model is not None:
+            if self.use_afterstate_net:
+                for a in legal_actions:
+                    nb, _, lr, ch = Bitboard2048.move(bb, a)
+                    if ch:
+                        canon = Bitboard2048.get_canonical(nb)
+                        if canon in self.tt:
+                            v = self.tt[canon]
+                        else:
+                            v = float(self._batch_evaluate_boards([nb])[0])
+                        q_vals[a] = lr + self.gamma * v
+            else:
+                np_board = Bitboard2048.to_array(bb)
+                obs = one_hot_encode_board(np_board)
+                obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
+                with torch.inference_mode():
+                    raw_q = self.model(obs_t).squeeze(0).cpu().numpy()
+                for a in legal_actions:
+                    q_vals[a] = raw_q[a]
+        elif self.use_ntuple and self.ntuple_net is not None:
+            for a in legal_actions:
+                nb, _, lr, ch = Bitboard2048.move(bb, a)
+                if ch:
+                    v = self.ntuple_net.evaluate_bitboard(nb)
+                    q_vals[a] = lr + self.gamma * v
+        else:
+            p = np.zeros(4, dtype=np.float32)
+            p[list(legal_actions)] = 1.0 / len(legal_actions)
+            return p
+
+        # Softmax over legal actions
+        legal_list = list(legal_actions)
+        legal_q = q_vals[legal_list]
+        max_q = float(np.max(legal_q))
+        exp_q = np.exp(np.clip(legal_q - max_q, -50.0, 50.0))
+        sum_exp = float(np.sum(exp_q))
+        pi = np.zeros(4, dtype=np.float32)
+        if sum_exp > 0:
+            pi[legal_list] = (exp_q / sum_exp).astype(np.float32)
+        else:
+            pi[legal_list] = 1.0 / len(legal_list)
+        return pi
+
+    def _prune_actions_with_policy(
+        self,
+        bb: int,
+        legal_actions: Sequence[int],
+        tau: Optional[float] = None,
+    ) -> List[int]:
+        """Prune action branches where pi(a | s) < tau, unless all other actions are suicidal.
+
+        Args:
+            bb: 64-bit bitboard integer.
+            legal_actions: Sequence of legal action indices.
+            tau: Pruning threshold (defaults to self.policy_prune_tau).
+
+        Returns:
+            List of survived action indices.
+        """
+        if len(legal_actions) <= 1:
+            return list(legal_actions)
+
+        cutoff = self.policy_prune_tau if tau is None else tau
+        pi = self.get_action_policy(bb, legal_actions)
+        survivors = [a for a in legal_actions if pi[a] >= cutoff]
+
+        def is_suicidal(a: int) -> bool:
+            nb, _, _, ch = Bitboard2048.move(bb, a)
+            if not ch:
+                return True
+            return Bitboard2048.is_terminal(nb)
+
+        non_suicidal_legal = [a for a in legal_actions if not is_suicidal(a)]
+        non_suicidal_survivors = [a for a in survivors if not is_suicidal(a)]
+
+        if non_suicidal_survivors:
+            return non_suicidal_survivors
+        if non_suicidal_legal:
+            return non_suicidal_legal
+        if survivors:
+            return survivors
+        return [int(np.argmax(pi))]
 
     def select_action(
         self,
@@ -160,6 +305,9 @@ class ExpectimaxSearcher:
         apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
         use_afterstate_net: Optional[bool] = None,
+        use_ntuple: Optional[bool] = None,
+        use_smoothness: Optional[bool] = None,
+        use_policy_pruning: Optional[bool] = None,
     ) -> int:
         """Select best action using lookahead search.
 
@@ -172,6 +320,9 @@ class ExpectimaxSearcher:
             apex_mode: Optional apex mode toggle overriding instance default.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance default.
             use_afterstate_net: Optional afterstate value network toggle overriding instance default.
+            use_ntuple: Optional N-Tuple leaf evaluation toggle overriding instance default.
+            use_smoothness: Optional Manhattan smoothness toggle overriding instance default.
+            use_policy_pruning: Optional policy pruning toggle overriding instance default.
 
         Returns:
             Selected integer action in {0, 1, 2, 3}.
@@ -185,6 +336,9 @@ class ExpectimaxSearcher:
             apex_mode=apex_mode,
             use_snake_heuristic=use_snake_heuristic,
             use_afterstate_net=use_afterstate_net,
+            use_ntuple=use_ntuple,
+            use_smoothness=use_smoothness,
+            use_policy_pruning=use_policy_pruning,
         )
         return best_action
 
@@ -198,6 +352,9 @@ class ExpectimaxSearcher:
         apex_mode: Optional[bool] = None,
         use_snake_heuristic: Optional[bool] = None,
         use_afterstate_net: Optional[bool] = None,
+        use_ntuple: Optional[bool] = None,
+        use_smoothness: Optional[bool] = None,
+        use_policy_pruning: Optional[bool] = None,
     ) -> Tuple[int, Dict[int, float]]:
         """Perform Expectimax search from current board state.
 
@@ -210,6 +367,9 @@ class ExpectimaxSearcher:
             apex_mode: Optional apex mode toggle overriding instance setting.
             use_snake_heuristic: Optional snake heuristic toggle overriding instance setting.
             use_afterstate_net: Optional afterstate value net toggle overriding instance setting.
+            use_ntuple: Optional N-Tuple evaluation toggle overriding instance setting.
+            use_smoothness: Optional Manhattan smoothness toggle overriding instance setting.
+            use_policy_pruning: Optional policy pruning toggle overriding instance setting.
 
         Returns:
             Tuple of (best_action, q_values_dict).
@@ -232,6 +392,16 @@ class ExpectimaxSearcher:
         d4_active = self.use_d4_symmetry if use_d4_symmetry is None else use_d4_symmetry
         snake_active = self.use_snake_heuristic if use_snake_heuristic is None else use_snake_heuristic
         afterstate_active = self.use_afterstate_net if use_afterstate_net is None else use_afterstate_net
+
+        # Temporary overrides if passed
+        if use_ntuple is not None:
+            self.use_ntuple = use_ntuple
+            if self.use_ntuple and self.ntuple_net is None:
+                self.ntuple_net = NTupleNetwork()
+        if use_smoothness is not None:
+            self.use_smoothness = use_smoothness
+        if use_policy_pruning is not None:
+            self.use_policy_pruning = use_policy_pruning
 
         # Prune cache between moves if maximum capacity is exceeded
         if len(self.tt) > self.tt_max_size:
@@ -343,11 +513,16 @@ class ExpectimaxSearcher:
         use_snake: bool = True,
     ) -> Tuple[int, Dict[int, float]]:
         """1-ply lookahead: evaluate afterstate for each legal action."""
+        act_candidates = (
+            self._prune_actions_with_policy(bb, legal_actions)
+            if self.use_policy_pruning
+            else legal_actions
+        )
         after_boards: List[int] = []
         imm_rewards: List[float] = []
         valid_actions: List[int] = []
 
-        for a in legal_actions:
+        for a in act_candidates:
             nb, _, lr, changed = Bitboard2048.move(bb, a)
             if changed:
                 after_boards.append(nb)
@@ -382,10 +557,15 @@ class ExpectimaxSearcher:
             3. Evaluates all unique un-cached leaf states via Transposition Table and batched GPU pass.
             4. Returns action maximizing Q(s, a) = r + gamma * sum(P(spawn) * V(s')).
         """
+        act_candidates = (
+            self._prune_actions_with_policy(bb, legal_actions)
+            if self.use_policy_pruning
+            else legal_actions
+        )
         all_leaves: List[int] = []
         tree: Dict[int, Tuple[float, List[Tuple[float, int]]]] = {}
 
-        for a in legal_actions:
+        for a in act_candidates:
             nb, _, lr, changed = Bitboard2048.move(bb, a)
             if not changed:
                 continue
@@ -454,7 +634,13 @@ class ExpectimaxSearcher:
             6 if self.max_empty_samples is None else min(6, self.max_empty_samples)
         )
 
-        for a1 in legal_actions:
+        act_candidates = (
+            self._prune_actions_with_policy(bb, legal_actions)
+            if self.use_policy_pruning
+            else legal_actions
+        )
+
+        for a1 in act_candidates:
             nb1, _, lr1, changed1 = Bitboard2048.move(bb, a1)
             if not changed1:
                 continue
@@ -489,8 +675,13 @@ class ExpectimaxSearcher:
                         # Terminal chance outcome: value 0.0
                         chance_branches.append((w_chance, []))
                     else:
+                        legal2_candidates = (
+                            self._prune_actions_with_policy(s_chance, legal2)
+                            if self.use_policy_pruning
+                            else legal2
+                        )
                         act2_moves: List[Tuple[float, int]] = []
-                        for a2 in legal2:
+                        for a2 in legal2_candidates:
                             nb2, _, lr2, ch2 = Bitboard2048.move(s_chance, a2)
                             if ch2:
                                 act2_moves.append((lr2, nb2))
@@ -544,7 +735,13 @@ class ExpectimaxSearcher:
             4 if self.max_empty_samples is None else min(4, self.max_empty_samples)
         )
 
-        for a1 in legal_actions:
+        act_candidates = (
+            self._prune_actions_with_policy(bb, legal_actions)
+            if self.use_policy_pruning
+            else legal_actions
+        )
+
+        for a1 in act_candidates:
             nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
             if not ch1:
                 continue
@@ -575,8 +772,13 @@ class ExpectimaxSearcher:
                         chance1_branches.append((w1, []))
                         continue
 
+                    legal2_candidates = (
+                        self._prune_actions_with_policy(s1, legal2)
+                        if self.use_policy_pruning
+                        else legal2
+                    )
                     act2_branches = []
-                    for a2 in legal2:
+                    for a2 in legal2_candidates:
                         nb2, _, lr2, ch2 = Bitboard2048.move(s1, a2)
                         if not ch2:
                             continue
@@ -683,6 +885,8 @@ class ExpectimaxSearcher:
         tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]] = {}
 
         filt_actions1 = self._filter_corner_preserving_actions(bb, legal_actions)
+        if self.use_policy_pruning:
+            filt_actions1 = self._prune_actions_with_policy(bb, filt_actions1)
 
         for a1 in filt_actions1:
             nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
@@ -718,6 +922,8 @@ class ExpectimaxSearcher:
                         continue
 
                     filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+                    if self.use_policy_pruning:
+                        filt_actions2 = self._prune_actions_with_policy(s1, filt_actions2)
                     act2_branches = []
 
                     for a2 in filt_actions2:
@@ -829,6 +1035,8 @@ class ExpectimaxSearcher:
         tree: Dict[int, Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, List[Tuple[float, int]]]]]]]]]]]] = {}
 
         filt_actions1 = self._filter_corner_preserving_actions(bb, legal_actions)
+        if self.use_policy_pruning:
+            filt_actions1 = self._prune_actions_with_policy(bb, filt_actions1)
 
         for a1 in filt_actions1:
             nb1, _, lr1, ch1 = Bitboard2048.move(bb, a1)
@@ -863,6 +1071,8 @@ class ExpectimaxSearcher:
                         continue
 
                     filt_actions2 = self._filter_corner_preserving_actions(s1, legal2)
+                    if self.use_policy_pruning:
+                        filt_actions2 = self._prune_actions_with_policy(s1, filt_actions2)
                     act2_branches = []
 
                     for a2 in filt_actions2:
@@ -997,16 +1207,23 @@ class ExpectimaxSearcher:
         boards: Sequence[Union[np.ndarray, int]],
         use_d4: Optional[bool] = None,
         use_snake: Optional[bool] = None,
+        use_ntuple: Optional[bool] = None,
+        use_smoothness: Optional[bool] = None,
     ) -> np.ndarray:
-        """Evaluate a collection of boards in a single GPU forward pass with optional D4 and topological shield.
+        """Evaluate a collection of boards combining neural net, N-Tuple, and geometric shield.
+
+        Unified Leaf Scoring Pipeline:
+            V_leaf(B) = V_ntuple(B) + w_smooth * S_smooth(B) - w_trap * P_trapped(B) + V_net(B)
 
         Args:
             boards: Sequence of 4x4 integer boards or 64-bit bitboard integers.
             use_d4: Optional toggle overriding instance setting.
             use_snake: Optional toggle overriding instance setting.
+            use_ntuple: Optional toggle overriding instance setting.
+            use_smoothness: Optional toggle overriding instance setting.
 
         Returns:
-            1D numpy array of values V(s) = max_{a in legal} Q(s, a), or 0.0 if terminal.
+            1D numpy array of values V_leaf(B), or 0.0 if terminal.
         """
         n = len(boards)
         if n == 0:
@@ -1035,50 +1252,79 @@ class ExpectimaxSearcher:
             exps = _POWER_LUT[clipped].astype(np.uint8)
             masks_np = np.stack([self.core.get_action_mask(b) for b in boards])
 
-        # Non-blocking transfer of compact uint8 representation to GPU
-        exps_t = torch.from_numpy(exps).to(self.device, non_blocking=True)
-        obs_t = F.one_hot(exps_t.long(), 16).permute(0, 3, 1, 2).float()
+        # 1. Base Neural Network Evaluation V_net(B)
+        if self.model is not None:
+            # Non-blocking transfer of compact uint8 representation to GPU
+            exps_t = torch.from_numpy(exps).to(self.device, non_blocking=True)
+            obs_t = F.one_hot(exps_t.long(), 16).permute(0, 3, 1, 2).float()
 
-        masks_t = torch.from_numpy(masks_np).bool().to(self.device, non_blocking=True)
-        has_legal = masks_t.any(dim=-1)
+            masks_t = torch.from_numpy(masks_np).bool().to(self.device, non_blocking=True)
+            has_legal = masks_t.any(dim=-1)
 
-        self.model.eval()
-        with torch.inference_mode():
-            with torch.amp.autocast(
-                device_type=self.device.type,
-                enabled=(self.device.type == "cuda"),
-            ):
-                if self.use_afterstate_net:
-                    if d4_active:
-                        batch_d4 = generate_d4_tensors(obs_t)
-                        v_d4 = self.model.forward_value(batch_d4)  # (8 * n,)
-                        v_k = v_d4.view(8, n)
-                        v_sym = v_k.mean(dim=0)  # (n,)
-                        v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+            self.model.eval()
+            with torch.inference_mode():
+                with torch.amp.autocast(
+                    device_type=self.device.type,
+                    enabled=(self.device.type == "cuda"),
+                ):
+                    if self.use_afterstate_net:
+                        if d4_active:
+                            batch_d4 = generate_d4_tensors(obs_t)
+                            v_d4 = self.model.forward_value(batch_d4)  # (8 * n,)
+                            v_k = v_d4.view(8, n)
+                            v_sym = v_k.mean(dim=0)  # (n,)
+                            v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+                        else:
+                            v_raw = self.model.forward_value(obs_t)  # (n,)
+                            v_vals = torch.where(has_legal, v_raw, torch.zeros_like(v_raw))
                     else:
-                        v_raw = self.model.forward_value(obs_t)  # (n,)
-                        v_vals = torch.where(has_legal, v_raw, torch.zeros_like(v_raw))
-                else:
-                    if d4_active:
-                        batch_d4 = generate_d4_tensors(obs_t)
-                        batch_masks = generate_d4_masks(masks_t)
+                        if d4_active:
+                            batch_d4 = generate_d4_tensors(obs_t)
+                            batch_masks = generate_d4_masks(masks_t)
 
-                        q_vals = self.model(batch_d4, action_mask=batch_masks)
-                        q_d4 = q_vals.view(8, n, 4)
-                        # Symmetrized value: mean of maximum legal Q-values across 8 orientations
-                        v_k = q_d4.max(dim=-1).values  # (8, n)
-                        v_sym = v_k.mean(dim=0)  # (n,)
-                        v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
-                    else:
-                        q_vals = self.model(obs_t, action_mask=masks_t)
-                        v_vals = torch.where(
-                            has_legal,
-                            q_vals.max(dim=-1).values,
-                            torch.zeros_like(q_vals[:, 0]),
-                        )
+                            q_vals = self.model(batch_d4, action_mask=batch_masks)
+                            q_d4 = q_vals.view(8, n, 4)
+                            # Symmetrized value: mean of maximum legal Q-values across 8 orientations
+                            v_k = q_d4.max(dim=-1).values  # (8, n)
+                            v_sym = v_k.mean(dim=0)  # (n,)
+                            v_vals = torch.where(has_legal, v_sym, torch.zeros_like(v_sym))
+                        else:
+                            q_vals = self.model(obs_t, action_mask=masks_t)
+                            v_vals = torch.where(
+                                has_legal,
+                                q_vals.max(dim=-1).values,
+                                torch.zeros_like(q_vals[:, 0]),
+                            )
 
             v_np = v_vals.float().cpu().numpy()
+        else:
+            v_np = np.zeros(n, dtype=np.float32)
 
+        # 2. SOTA N-Tuple Leaf Evaluation V_ntuple(B)
+        ntuple_active = self.use_ntuple if use_ntuple is None else use_ntuple
+        if ntuple_active and self.ntuple_net is not None:
+            if isinstance(first, (int, np.integer)):
+                v_ntuple = self.ntuple_net.evaluate_batch(bbs)
+            else:
+                bbs_arr = np.array([Bitboard2048.from_array(b) for b in boards], dtype=np.uint64)
+                v_ntuple = self.ntuple_net.evaluate_batch(bbs_arr)
+        else:
+            v_ntuple = np.zeros(n, dtype=np.float32)
+
+        # 3. Geometric Shield: Manhattan Smoothness S_smooth(B) and Trapped Wedge Penalty P_trapped(B)
+        smoothness_active = self.use_smoothness if use_smoothness is None else use_smoothness
+        if smoothness_active:
+            if isinstance(first, (int, np.integer)):
+                bbs_geom = bbs
+            else:
+                bbs_geom = np.array([Bitboard2048.from_array(b) for b in boards], dtype=np.uint64)
+            s_smooth = Bitboard2048.compute_smoothness_batch(bbs_geom)
+            p_trapped = Bitboard2048.compute_trapped_penalty_batch(bbs_geom)
+            geom_val = self.w_smooth * s_smooth - self.w_trap * p_trapped
+        else:
+            geom_val = np.zeros(n, dtype=np.float32)
+
+        # 4. Topological Snake Monotonicity & Corner-Lock Heuristic
         if snake_active:
             ranks_flat = exps.reshape(n, 16).astype(np.float32)
             # Dot product with 8x16 snake templates and take maximum
@@ -1106,21 +1352,22 @@ class ExpectimaxSearcher:
                 0.0,
                 np.where(is_corner, 0.0, np.where(is_interior, k_max * 2.0, k_max * 1.0)),
             )
+            snake_val = self.alpha_snake * total_snake_scores - self.beta_corner * penalties
+        else:
+            snake_val = np.zeros(n, dtype=np.float32)
 
-            has_legal_np = masks_np.any(axis=-1)
-            v_final = np.where(
-                has_legal_np,
-                v_np + self.alpha_snake * total_snake_scores - self.beta_corner * penalties,
-                0.0,
-            )
-            return v_final.astype(np.float32)
-
-        return v_np
+        has_legal_np = masks_np.any(axis=-1)
+        v_final = np.where(
+            has_legal_np,
+            v_np + v_ntuple + geom_val + snake_val,
+            0.0,
+        )
+        return v_final.astype(np.float32)
 
 
 def expectimax_search(
     board: Union[np.ndarray, int],
-    model: nn.Module,
+    model: Optional[nn.Module] = None,
     device: Optional[torch.device] = None,
     depth: int = 2,
     gamma: float = 0.99,
@@ -1131,6 +1378,14 @@ def expectimax_search(
     use_snake_heuristic: bool = True,
     alpha_snake: float = 0.5,
     beta_corner: float = 1.0,
+    use_afterstate_net: bool = False,
+    use_ntuple: bool = False,
+    ntuple_net: Optional[NTupleNetwork] = None,
+    use_smoothness: bool = False,
+    w_smooth: float = 0.1,
+    w_trap: float = 5.0,
+    use_policy_pruning: bool = False,
+    policy_prune_tau: float = 0.03,
 ) -> Tuple[int, Dict[int, float]]:
     """Functional convenience wrapper for ExpectimaxSearcher.search."""
     searcher = ExpectimaxSearcher(
@@ -1145,6 +1400,14 @@ def expectimax_search(
         use_snake_heuristic=use_snake_heuristic,
         alpha_snake=alpha_snake,
         beta_corner=beta_corner,
+        use_afterstate_net=use_afterstate_net,
+        use_ntuple=use_ntuple,
+        ntuple_net=ntuple_net,
+        use_smoothness=use_smoothness,
+        w_smooth=w_smooth,
+        w_trap=w_trap,
+        use_policy_pruning=use_policy_pruning,
+        policy_prune_tau=policy_prune_tau,
     )
     return searcher.search(
         board,
@@ -1153,4 +1416,8 @@ def expectimax_search(
         adaptive_depth=adaptive_depth,
         apex_mode=apex_mode,
         use_snake_heuristic=use_snake_heuristic,
+        use_afterstate_net=use_afterstate_net,
+        use_ntuple=use_ntuple,
+        use_smoothness=use_smoothness,
+        use_policy_pruning=use_policy_pruning,
     )
