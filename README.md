@@ -13,15 +13,15 @@ An enterprise-grade, high-performance Deep Reinforcement Learning (DRL) system d
 
 ## Key Features
 
-- **Zero Handcrafted Heuristics:** The agent discovers topological corner-packing strategies, monotonicity gradients, and cascade combinations autonomously through log-scaled fusion rewards ($r = \sum \log_2(\text{merged\_tile})$) and long-term expected Bellman return optimization ($\gamma = 0.99$).
+- **Zero Handcrafted Heuristics:** The agent discovers topological corner-packing strategies, monotonicity gradients, and cascade combinations autonomously through log-scaled fusion rewards ($r = \sum \log_2(v_{\text{merged}})$) and long-term expected Bellman return optimization ($\gamma = 0.99$).
 - **64-Bit Bitboard Engine:** Single `uint64` board representation with 4-bit nibbles and precomputed 16-bit row transition LUTs achieving $> 485,000\text{ moves/s}$ per CPU core in pure Python.
 - **Microsecond N-Tuple Leaf Evaluation:** Canonical 4-line, 6-rect, and 6-snake geometric patterns with base-16 addressing and $D_4$ weight sharing, evaluating board positions in **$< 1.0\ \mu\text{s}$** ($> 1,100,000\text{ boards/s}$) to eliminate GPU forward latency bottlenecks during deep tree search.
 - **N-Tuple TD($\lambda$) Self-Play Training Pipeline:** Pure CPU self-play training engine running at $> 12,500\text{ steps/s}$ with afterstate Bellman updates $\delta = r_{\text{next}} + (1 - d)\gamma V(s'_{\text{after}}) - V(s_{\text{after}})$ and linear $\alpha$ decay.
 - **Deep Expectimax Search:** High-throughput lookahead search engine with canonical Dihedral $D_4$ Transposition Tables, beam search, and chance node probability pruning ($p < 0.001$).
 - **Adaptive & Apex Depth Selection:** Dynamically scales lookahead depth from 2-ply in open boards, to 3-ply and 4-ply in mid-to-late games, up to 5-ply / 6-ply search in apex endgames.
-- **Protected Policy-Guided Action Pruning:** Prunes non-viable branches ($\pi(a \mid s) < \tau$) at shallow plies, with a strict safety bypass in danger states ($\text{empty\_cells} \le 4$ or $\text{max\_tile} \ge 2048$) to ensure complete evaluation of all legal moves.
+- **Protected Policy-Guided Action Pruning:** Prunes non-viable branches ($\pi(a \mid s) < \tau$) at shallow plies, with a strict safety bypass in danger states (empty cells $\le 4$ or max tile $\ge 2048$) to ensure complete evaluation of all legal moves.
 - **Manhattan Smoothness & Trapped Wedge Shield:** Precomputed 65,536-entry LUT evaluating rank continuity ($S_{\text{smooth}}$) and detecting outer-wall low-tier wedges ($P_{\text{trapped}}$) flanked by high-value tiles.
-- **Native Afterstate Value Learning:** Decomposes transitions into $s \xrightarrow{a} s_{\text{after}} \xrightarrow{\text{spawn}} s'$, optimizing $V(s_{\text{after}})$ directly to completely isolate environmental spawn stochasticity from policy evaluation.
+- **Native Afterstate Value Learning:** Decomposes transitions into $s \to s_{\text{after}} \to s'$, optimizing $V(s_{\text{after}})$ directly to completely isolate environmental spawn stochasticity from policy evaluation.
 - **Synchronous Vectorized Engine:** `VectorizedGame2048Env` simulating $N$ concurrent board states simultaneously with auto-resetting sub-environments.
 - **Multi-Channel Tensor Representation:** Multi-plane binary state encoding ($\mathbf{X} \in \mathbb{R}^{B \times 16 \times 4 \times 4}$) that maps tile powers $2^k$ to discrete convolutional channels with strict spatial partition of unity.
 - **Dueling Double DQN Architecture:** Decoupled value $V(s)$ and advantage $A(s, a)$ streams driven by asymmetric multi-scale convolutional kernels ($(1, 2)$, $(2, 1)$, $(2, 2)$, $(1, 1)$) with centered identifiability aggregation.

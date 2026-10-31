@@ -139,8 +139,8 @@ python scripts/export_onnx.py --checkpoint checkpoints/checkpoint_best.pt --outp
 ### Technical Export Specifications:
 - **Opset Version**: 17
 - **Dynamic Axes**: Dynamic batching dimension `batch_size`:
-  - Input: `observation` $\to (\text{batch\_size}, 16, 4, 4)$
-  - Output: `q_values` $\to (\text{batch\_size}, 4)$
+  - Input: `observation` $\to$ shape `(batch_size, 16, 4, 4)`
+  - Output: `q_values` $\to$ shape `(batch_size, 4)`
 - **Numerical Parity**: Automated validation compares PyTorch native inference with ONNX Runtime (`CPUExecutionProvider` / `CUDAExecutionProvider`):
   $$\max_{i, a} |Q_{\text{PyTorch}}(s_i, a) - Q_{\text{ONNX}}(s_i, a)| < 10^{-5}$$
   Typical empirical max error observed: $< 10^{-7}$.

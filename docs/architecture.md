@@ -164,4 +164,4 @@ Depth is dynamically selected based on board occupancy and criticality:
 ### 9.3. Protected Policy-Guided Action Pruning
 At shallow plies (depth 0 and 1), action candidates are queried via prior policy $\pi(a \mid s) = \text{Softmax}(Q(s, \cdot) / \tau_{\text{temp}})$.
 - Actions with $\pi(a \mid s) < \tau$ (e.g., $\tau = 0.03$) are pruned to reduce branching factor.
-- **Danger Bypass Protection:** If $\text{empty\_cells} \le 4$ or $\text{max\_tile} \ge 2048$, policy pruning is **strictly disabled**, guaranteeing all legal moves are explored to prevent premature game-over on tight boards.
+- **Danger Bypass Protection:** If empty cells $\le 4$ or max tile $\ge 2048$, policy pruning is **strictly disabled**, guaranteeing all legal moves are explored to prevent premature game-over on tight boards.

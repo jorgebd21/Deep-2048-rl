@@ -111,7 +111,7 @@ Each 4-cell row is an unsigned 16-bit integer ($R \in [0, 65535]$):
 - `ROW_LEFT_TABLE`: Precomputed resulting 16-bit row after sliding left and merging.
 - `ROW_RIGHT_TABLE`: Precomputed resulting 16-bit row after sliding right and merging.
 - `ROW_SCORE_TABLE_LEFT` / `ROW_SCORE_TABLE_RIGHT`: Exact in-game merge points scored.
-- `ROW_REWARD_TABLE_LEFT` / `ROW_REWARD_TABLE_RIGHT`: Sum of logarithmic rewards $\sum \log_2(\text{merged\_tile})$.
+- `ROW_REWARD_TABLE_LEFT` / `ROW_REWARD_TABLE_RIGHT`: Sum of logarithmic rewards $\sum \log_2(v_{\text{merged}})$.
 
 ### 5.3. Bitwise Move Operations & Symmetries
 - **Horizontal Moves (`LEFT`, `RIGHT`):** Directly query the precomputed 16-bit row tables for each of the 4 rows in parallel:
