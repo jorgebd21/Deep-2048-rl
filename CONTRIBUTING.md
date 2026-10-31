@@ -37,7 +37,7 @@ Before writing any code, please review the strict engineering constraints govern
 
 ```bash
 # Fork and clone repository
-git clone https://github.com/lobero21/deep-2048-rl.git
+git clone https://github.com/jorgebd21/Deep-2048-rl.git
 cd deep-2048-rl
 
 # Initialize virtual environment

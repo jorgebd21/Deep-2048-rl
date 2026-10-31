@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lobero21/deep-2048-rl/actions"><img src="https://img.shields.io/badge/pytest-120%2F120%20passing-00FFA3?style=for-the-badge&logo=pytest&logoColor=black" alt="Test Status"></a>
+  <a href="https://github.com/jorgebd21/Deep-2048-rl/actions"><img src="https://img.shields.io/badge/pytest-120%2F120%20passing-00FFA3?style=for-the-badge&logo=pytest&logoColor=black" alt="Test Status"></a>
   <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.11%2B-00B8D9?style=for-the-badge&logo=python&logoColor=white" alt="Python Version"></a>
   <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.x%20%7C%20CUDA%2012.x-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch CUDA"></a>
   <a href="https://developer.nvidia.com/cuda-gpus"><img src="https://img.shields.io/badge/NVIDIA%20Ampere-RTX%203060%20%7C%20TF32-76B900?style=for-the-badge&logo=nvidia&logoColor=white" alt="NVIDIA Ampere"></a>
@@ -65,7 +65,7 @@ Experience the autonomous agent playing live in your terminal with zero setup ov
 
 ```bash
 # Clone the repository
-git clone https://github.com/lobero21/deep-2048-rl.git
+git clone https://github.com/jorgebd21/Deep-2048-rl.git
 cd deep-2048-rl
 
 # Set up isolated virtual environment
@@ -452,7 +452,7 @@ If you use Deep-2048-RL in your academic research or reinforcement learning benc
   year = {2026},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/lobero21/deep-2048-rl}}
+  howpublished = {\url{https://github.com/jorgebd21/Deep-2048-rl}}
 }
 ```
 
