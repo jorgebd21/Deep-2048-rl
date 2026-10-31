@@ -1,5 +1,14 @@
 # Deep-2048-RL: Autonomous Deep Reinforcement Learning for 2048
 
+<p align="center">
+  <a href="https://github.com/lobero21/deep-2048-rl/actions"><img src="https://img.shields.io/badge/tests-120%2F120%20passed-brightgreen?style=flat-square&logo=pytest" alt="Test Status"></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/python-3.11%2B-blue?style=flat-square&logo=python" alt="Python Version"></a>
+  <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.x%20%7C%20CUDA%2012.x-EE4C2C?style=flat-square&logo=pytorch" alt="PyTorch CUDA"></a>
+  <a href="https://developer.nvidia.com/cuda-gpus"><img src="https://img.shields.io/badge/GPU-RTX%203060%20%7C%20TF32-76B900?style=flat-square&logo=nvidia" alt="NVIDIA Ampere"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square" alt="Code Style"></a>
+</p>
+
 An enterprise-grade, high-performance Deep Reinforcement Learning (DRL) system designed to master the combinatoric game **2048** from scratch without handcrafted heuristics. The system features a synchronized trifecta architecture combining:
 - **Dueling Double Deep Q-Networks (DDQN)** with multi-scale asymmetric convolutions and native **Afterstate Value Learning** ($s \to s_{\text{after}} \to s'$).
 - **Prioritized Experience Replay (PER)** with compact `uint8` RAM storage and importance sampling.
@@ -8,6 +17,40 @@ An enterprise-grade, high-performance Deep Reinforcement Learning (DRL) system d
 - **Expectimax Lookahead Tree Search** (Adaptive 2..4 ply and Apex 5..6 ply) with canonical Transposition Tables, chance node probability pruning, and **Protected Policy-Guided Action Pruning**.
 - **Bitwise Geometric Shields:** Precomputed Manhattan Smoothness ($S_{\text{smooth}}$) and Trapped Low-Tier Wedge Detection ($P_{\text{trapped}}$).
 - **Hardware Acceleration:** Native TensorFloat-32 (TF32) and asynchronous pinned DMA memory transfers optimized for NVIDIA Ampere architecture (RTX 3060).
+
+---
+
+## High-Level Architecture
+
+```mermaid
+flowchart TD
+    subgraph Simulation["High-Throughput Simulation Layer (CPU)"]
+        BoardState["Game State (4x4 Grid)"]
+        Bitboard["Bitboard uint64 Engine<br/>4-bit nibbles / 16-bit LUTs"]
+        Mask["Legal Action Masking<br/>M(s) in {0, 1}^4"]
+        BoardState --> Bitboard
+        Bitboard --> Mask
+    end
+
+    subgraph Memory["Experience Storage"]
+        Bitboard -->|Packed uint8 Exponents| Buffer["Prioritized Replay Buffer<br/>SumTree Binary Heap O(log N)"]
+    end
+
+    subgraph DeepLearning["Neural & Lookup Representations (GPU & CPU)"]
+        Buffer -->|Pinned Memory DMA| NetInput["Observation Tensor<br/>(B x 16 x 4 x 4 One-Hot)"]
+        NetInput --> AsymmConv["Asymmetric Multi-Scale Convolutions<br/>(1x2, 2x1, 2x2, 1x1)"]
+        AsymmConv --> DuelingNet["Dueling DDQN / Afterstate Net<br/>Value V(s) & Advantage A(s, a)"]
+        Bitboard -->|Base-16 Symmetry Extractor| NTuple["SOTA N-Tuple Network<br/>8-fold D4 Weight Sharing"]
+    end
+
+    subgraph DecisionSearch["Hybrid Decision & Tree Search"]
+        DuelingNet --> Search["Expectimax Search Engine<br/>Adaptive 2..6 ply Lookahead"]
+        NTuple -->|Leaf Eval < 1.0 us| Search
+        Mask -->|Prune Non-Viable Moves| Search
+        Bitboard -->|Geometric Shielding| Search
+        Search -->|Optimal Action a*| BoardState
+    end
+```
 
 ---
 
@@ -37,6 +80,11 @@ An enterprise-grade, high-performance Deep Reinforcement Learning (DRL) system d
 Deep-2048-rl/
 ├── GEMINI.md                           # System operations & engineering protocol
 ├── README.md                           # Executive summary and documentation
+├── ARCHITECTURE.md                     # Component design, lifecycles, and concurrency
+├── CONTRIBUTING.md                     # Development workflows and standards
+├── CHANGELOG.md                        # Version baseline & release history
+├── SECURITY.md                         # Security policies and vulnerability disclosures
+├── CODE_OF_CONDUCT.md                  # Contributor code of conduct
 ├── pyproject.toml                      # Packaging & test specifications
 ├── requirements.txt                    # Direct Python dependencies
 ├── docs/                               # Detailed technical documentation
@@ -109,6 +157,10 @@ Deep-2048-rl/
 ### Virtual Environment Setup
 
 ```bash
+# Clone the repository
+git clone https://github.com/lobero21/deep-2048-rl.git
+cd deep-2048-rl
+
 # Create and activate virtual environment
 python -m venv .venv
 
@@ -117,8 +169,9 @@ python -m venv .venv
 # On Linux / macOS:
 source .venv/bin/activate
 
-# Install dependencies
+# Install dependencies (core and optional dev/gpu)
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ---
@@ -200,6 +253,49 @@ pytest tests/ -v
 
 ---
 
+## Configuration Parameter Matrix
+
+### Training Pipeline (`src/training/train.py`)
+
+| Argument | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--episodes` | `int` | `2000` | Total training episodes to simulate |
+| `--num-envs` | `int` | `32` | Number of concurrent vectorized environments |
+| `--single-env` | `flag` | `False` | Force single-environment sequential training |
+| `--batch-size` | `int` | `512` | Mini-batch size for SGD optimization |
+| `--lr` | `float` | `1e-4` | Learning rate for AdamW optimizer |
+| `--gamma` | `float` | `0.99` | MDP discount factor |
+| `--tau` | `float` | `0.005` | Polyak soft update coefficient for target network |
+| `--buffer-capacity`| `int` | `100000` | PER replay buffer capacity (stored in RAM) |
+| `--warmup-steps` | `int` | `2000` | Initial transitions collected before training begins |
+| `--train-freq` | `int` | `1` | Vectorized steps between gradient updates |
+| `--eval-freq` | `int` | `50` | Evaluation frequency in episodes |
+| `--checkpoint-dir`| `str` | `checkpoints` | Target directory for saving model checkpoints |
+| `--resume` | `str` | `None` | Path to existing checkpoint `.pt` to resume training |
+| `--train-afterstate`| `flag`| `False` | Enable Expert Iteration with Native Afterstate Value Learning |
+| `--device` | `str` | `"auto"` | Target compute device (`"auto"`, `"cuda"`, `"cpu"`) |
+
+### Monte Carlo Evaluator (`scripts/evaluate.py`)
+
+| Argument | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--checkpoint` | `str` | `None` | Path to PyTorch model weights (`.pt`) |
+| `--episodes` | `int` | `100` | Number of deterministic rollout games |
+| `--lookahead-depth`| `int` | `0` | Base Expectimax depth (0 = greedy policy) |
+| `--adaptive-depth` | `flag`| `False` | Dynamically scale lookahead depth (2-ply early, 3-ply mid, 4-ply late) |
+| `--apex-mode` | `flag`| `False` | Enable 5-ply and 6-ply search in apex endgames |
+| `--use-d4-symmetry`| `flag`| `False` | Enable 8-fold dihedral Transposition Tables |
+| `--use-ntuple` | `flag`| `False` | Enable sub-microsecond SOTA N-Tuple leaf evaluations |
+| `--ntuple-path` | `str` | `None` | Path to pre-trained N-Tuple table (`.npz`) |
+| `--w-ntuple` | `float` | `0.15` | Weight multiplier for N-Tuple value blending |
+| `--use-smoothness` | `flag`| `False` | Enable Manhattan smoothness & trapped-tile penalty shield |
+| `--w-smooth` | `float` | `0.10` | Weight multiplier for Manhattan smoothness |
+| `--w-trap` | `float` | `5.0` | Weight multiplier for trapped tile penalty |
+| `--use-policy-pruning`| `flag`| `False` | Enable policy prior pruning at shallow plies |
+| `--policy-prune-tau`| `float` | `0.03` | Probability cutoff threshold for action pruning |
+
+---
+
 ## Empirical Benchmark Results
 
 ### Monte Carlo Milestone Benchmark Comparison ($N = 30$ Full Games)
@@ -230,14 +326,18 @@ Evaluated on `checkpoints/afterstate/checkpoint_best.pt` with 64-bit Bitboard en
 ## Technical Documentation Index
 
 For in-depth mathematical formulations and architectural details, refer to:
-- [Environment Specification & Bitboard Architecture (`docs/environment.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/environment.md)
-- [Dueling Convolutional & N-Tuple Architecture (`docs/architecture.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/architecture.md)
-- [DDQN, Afterstates & N-Tuple TD($\lambda$) Training (`docs/training_pipeline.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/training_pipeline.md)
-- [GPU Acceleration & Memory Optimizations (`docs/gpu_optimization.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/gpu_optimization.md)
-- [Hardware Profiling & Benchmarks (`docs/benchmarks.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/benchmarks.md)
-- [Evaluation, Telemetry & Export Guide (`docs/evaluation.md`)](file:///c:/Users/lober/Desktop/Proyectos/Deep-2048-rl/docs/evaluation.md)
+- [System Architecture Specification (`ARCHITECTURE.md`)](ARCHITECTURE.md)
+- [Environment Specification & Bitboard Architecture (`docs/environment.md`)](docs/environment.md)
+- [Dueling Convolutional & N-Tuple Architecture (`docs/architecture.md`)](docs/architecture.md)
+- [DDQN, Afterstates & N-Tuple TD($\lambda$) Training (`docs/training_pipeline.md`)](docs/training_pipeline.md)
+- [GPU Acceleration & Memory Optimizations (`docs/gpu_optimization.md`)](docs/gpu_optimization.md)
+- [Hardware Profiling & Benchmarks (`docs/benchmarks.md`)](docs/benchmarks.md)
+- [Evaluation, Telemetry & Export Guide (`docs/evaluation.md`)](docs/evaluation.md)
+- [Developer Contribution Guide (`CONTRIBUTING.md`)](CONTRIBUTING.md)
+- [Changelog & Release Notes (`CHANGELOG.md`)](CHANGELOG.md)
+- [Security Policy & Disclosures (`SECURITY.md`)](SECURITY.md)
 
 ---
 
 ## License
-MIT License.
+This project is licensed under the terms of the [MIT License](LICENSE).

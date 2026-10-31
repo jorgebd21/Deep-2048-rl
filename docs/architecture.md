@@ -37,6 +37,26 @@ where:
 - $\text{dim}(\mathbf{K}) = 64 \times 4 \times 4 = 1024$
 - Total feature size: $1536 + 1536 + 1152 + 1024 = 5248$
 
+```mermaid
+flowchart LR
+    X["Input X: (B, 16, 4, 4)"]
+    CH["Conv2d (1, 2)<br/>128 ch -> (B, 128, 4, 3)"]
+    CV["Conv2d (2, 1)<br/>128 ch -> (B, 128, 3, 4)"]
+    CS["Conv2d (2, 2)<br/>128 ch -> (B, 128, 3, 3)"]
+    CK["Conv2d (1, 1)<br/>64 ch -> (B, 64, 4, 4)"]
+    Concat["Concat & Flatten<br/>dim = 5248"]
+    Shared["FC Shared<br/>(B, 512)"]
+    Val["Value Stream<br/>(B, 1)"]
+    Adv["Advantage Stream<br/>(B, 4)"]
+    Q["Centered Aggregation<br/>Q(s, a): (B, 4)"]
+
+    X --> CH & CV & CS & CK
+    CH & CV & CS & CK --> Concat
+    Concat --> Shared
+    Shared --> Val & Adv
+    Val & Adv --> Q
+```
+
 ---
 
 ## 3. Shared Representation Layer
