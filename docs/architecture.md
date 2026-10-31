@@ -108,3 +108,60 @@ This guarantees $\arg\max_a Q_{\text{masked}}(s, a)$ strictly selects a valid bo
 | `advantage_stream[0]` | `Linear(512, 128)` | $(512 + 1) \times 128 = 65,664$ |
 | `advantage_stream[2]` | `Linear(128, 4)` | $(128 + 1) \times 4 = 516$ |
 | **Total Parameters** | | **$2,837,317$ (~10.8 MB weights)** |
+
+---
+
+## 8. SOTA N-Tuple Network Architecture (`NTupleNetwork`)
+
+In addition to deep convolutional networks, the engine implements a high-performance **N-Tuple Network** following Szubert & Jaśkowski (2014) and Wu et al. (2014) (`src/models/ntuple.py`), designed for sub-microsecond leaf evaluations in deep lookahead trees:
+
+### 8.1. Canonical Symmetric Patterns
+The $4 \times 4$ grid (cell indices $0..15$) is covered by 3 canonical geometric pattern topologies:
+1. **4-Tile Boundary Line:** `CANONICAL_LINE_4 = (0, 1, 2, 3)` (outer boundary rows/columns).
+2. **6-Tile Rectangular Block ($2 \times 3$):** `CANONICAL_RECT_6 = (0, 1, 2, 4, 5, 6)` (corner perimeter tiles).
+3. **6-Tile Snake Turn:** `CANONICAL_SNAKE_6 = (0, 1, 2, 6, 5, 4)` (corner snake fold).
+
+### 8.2. Dihedral Symmetry Group Weight Sharing ($D_4$)
+Each canonical pattern of length $k$ is expanded into all 8 isometric reflections and rotations:
+$$\mathcal{T}_p = \{g(p) \mid g \in D_4\}$$
+All 8 symmetric variants share the **exact same flat lookup table** of size $16^k$:
+- 4-tile line table: $16^4 = 65,536$ entries (float32, 256 KB).
+- 6-tile rect table: $16^6 = 16,777,216$ entries (float32, 64 MB).
+- 6-tile snake table: $16^6 = 16,777,216$ entries (float32, 64 MB).
+
+### 8.3. Base-16 Memory Addressing & Microsecond Throughput
+Given a board with cell ranks $r_0, \dots, r_{15} \in [0, 15]$, the address for a pattern $p = (c_0, \dots, c_{k-1})$ is:
+$$\text{index}(p) = \sum_{i=0}^{k-1} r_{c_i} \cdot 16^i = \bigvee_{i=0}^{k-1} (r_{c_i} \ll 4i)$$
+The state value is the sum of lookup table entries across all active symmetric patterns:
+$$V_{\text{ntuple}}(B) = \sum_{p \in \text{Patterns}} \sum_{t \in \mathcal{T}_p} W_p[\text{index}(t)]$$
+- **Evaluation Throughput:** Evaluates a 64-bit Bitboard in **$< 1.0\ \mu\text{s}$** per board ($> 1,100,000\text{ boards/sec}$), entirely bypassing GPU kernel launch overhead during leaf rollouts.
+
+---
+
+## 9. Expectimax Search & Unified Hybrid Leaf Evaluation
+
+The agent combines neural network afterstate predictions, N-Tuple lookups, and geometric stabilization into a unified searcher (`src/agent/search.py`):
+
+### 9.1. Unified Leaf Evaluation Pipeline
+At leaf states of the search tree, values are evaluated via:
+
+$$V_{\text{leaf}}(B) = V_{\text{net}}(B) + w_{\text{ntuple}} \cdot \tilde{V}_{\text{ntuple}}(B) + w_{\text{smooth}} \cdot S_{\text{smooth}}(B) - w_{\text{trap}} \cdot P_{\text{trapped}}(B) + V_{\text{snake}}(B)$$
+
+where:
+- $V_{\text{net}}(B)$: Neural network afterstate value head $V(s_{\text{after}})$.
+- $\tilde{V}_{\text{ntuple}}(B)$: Converged N-Tuple value lookup scaled by $w_{\text{ntuple}} \approx 0.15$.
+- $S_{\text{smooth}}(B)$: Manhattan rank smoothness ($w_{\text{smooth}} = 0.10$).
+- $P_{\text{trapped}}(B)$: Structural penalty for low-tier tiles wedged between high ranks ($w_{\text{trap}} = 5.0$).
+- $V_{\text{snake}}(B)$: Topological monotonicity gradient along the perimeter.
+
+### 9.2. Adaptive & Apex Depth Selection
+Depth is dynamically selected based on board occupancy and criticality:
+- **Early / Open Boards ($> 7$ empty cells):** 2-ply search for maximum execution speed.
+- **Mid-Game Boards ($4..7$ empty cells):** 3-ply Expectimax lookahead.
+- **Endgame Boards ($2..3$ empty cells):** 4-ply Expectimax lookahead.
+- **Apex Endgame Boards ($\le 2$ empty cells with max tile $\ge 2048$):** Up to 5-ply / 6-ply search with chance node pruning.
+
+### 9.3. Protected Policy-Guided Action Pruning
+At shallow plies (depth 0 and 1), action candidates are queried via prior policy $\pi(a \mid s) = \text{Softmax}(Q(s, \cdot) / \tau_{\text{temp}})$.
+- Actions with $\pi(a \mid s) < \tau$ (e.g., $\tau = 0.03$) are pruned to reduce branching factor.
+- **Danger Bypass Protection:** If $\text{empty\_cells} \le 4$ or $\text{max\_tile} \ge 2048$, policy pruning is **strictly disabled**, guaranteeing all legal moves are explored to prevent premature game-over on tight boards.

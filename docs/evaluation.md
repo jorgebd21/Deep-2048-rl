@@ -1,6 +1,6 @@
 # Evaluation, Telemetry & Deployment Guide
 
-This document details the evaluation protocol, telemetry logging via TensorBoard, interactive CLI visualization, and production deployment via ONNX export for the **Deep-2048-RL** project.
+This document details the evaluation protocol, telemetry logging via TensorBoard, interactive CLI visualization, standalone N-Tuple training, and production deployment via ONNX export for the **Deep-2048-RL** project.
 
 ---
 
@@ -17,10 +17,11 @@ tensorboard --logdir runs
 #### A. Episode Performance (`episode/`)
 - `episode/score`: Cumulative in-game score achieved per episode.
 - `episode/steps`: Episode length (survival steps before terminal state).
-- `episode/max_tile`: Highest tile value produced ($128, 256, 512, 1024, 2048$).
+- `episode/max_tile`: Highest tile value produced ($128, 256, 512, 1024, 2048, 4096$).
 - `episode/reach_512`: Boolean indicator (1.0/0.0) recording milestone achievement.
 - `episode/reach_1024`: Boolean indicator (1.0/0.0) recording milestone achievement.
 - `episode/reach_2048`: Boolean indicator (1.0/0.0) recording milestone achievement.
+- `episode/reach_4096`: Boolean indicator (1.0/0.0) recording milestone achievement.
 
 #### B. Policy Optimization (`train/`)
 - `train/loss`: Importance Sampling weighted Smooth L1 (Huber) loss.
@@ -38,6 +39,7 @@ tensorboard --logdir runs
 - `eval/reach_512_rate`: Percentage of evaluation episodes reaching tile 512+.
 - `eval/reach_1024_rate`: Percentage of evaluation episodes reaching tile 1024+.
 - `eval/reach_2048_rate`: Percentage of evaluation episodes reaching tile 2048+.
+- `eval/reach_4096_rate`: Percentage of evaluation episodes reaching tile 4096+.
 
 ---
 
@@ -62,20 +64,71 @@ python scripts/play.py --checkpoint checkpoints/checkpoint_best.pt --manual-step
 
 ## 3. Monte Carlo Statistical Evaluation (`scripts/evaluate.py`)
 
-To quantify agent capabilities across stochastic board spawns (90% $2$, 10% $4$), `scripts/evaluate.py` performs Monte Carlo rollouts with deterministic greedy action selection ($\epsilon=0$):
+To quantify agent capabilities across stochastic board spawns (90% $2$, 10% $4$), `scripts/evaluate.py` performs Monte Carlo rollouts with deterministic action selection ($\epsilon=0$) and deep tree search:
 
+### 3.1. Standard Evaluation Command
 ```bash
-python scripts/evaluate.py --checkpoint checkpoints/checkpoint_best.pt --episodes 100 --save-json eval_results.json
+python scripts/evaluate.py --checkpoint checkpoints/afterstate/checkpoint_best.pt --episodes 100 --save-json eval_results.json
 ```
 
-### Metric Outputs:
-- **Score Distribution**: Mean, standard deviation, median, min, max score.
-- **Milestone Reach Percentages**: Exact empirical probability of reaching $256$, $512$, $1024$, and $2048$ tiles.
-- **Tile Frequency Histogram**: Exact distribution of terminal maximum tiles.
+### 3.2. Calibrated Hybrid Evaluation (SOTA Frontier)
+To evaluate the full trifecta architecture (Adaptive Depth Expectimax + $D_4$ Symmetries + Trained N-Tuple + Smoothness Shield):
+
+```bash
+python scripts/evaluate.py \
+  --checkpoint checkpoints/afterstate/checkpoint_best.pt \
+  --ntuple-path checkpoints/ntuple/ntuple_best.npz \
+  --episodes 30 \
+  --adaptive-depth \
+  --use-d4-symmetry \
+  --use-smoothness \
+  --use-ntuple \
+  --w-ntuple 0.15 \
+  --w-smooth 0.10 \
+  --w-trap 5.0
+```
+
+### 3.3. Key CLI Flags Reference:
+| Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--checkpoint` | `str` | `None` | Path to PyTorch model weights (`.pt`) |
+| `--episodes` | `int` | `100` | Number of evaluation episodes |
+| `--lookahead-depth` | `int` | `0` | Fixed Expectimax depth (0, 1, 2, 3, 4) |
+| `--adaptive-depth` | `flag` | `False` | Dynamically select depth based on empty cells |
+| `--apex-mode` | `flag` | `False` | Enable 5-ply / 6-ply lookahead in extreme endgames |
+| `--use-d4-symmetry` | `flag` | `False` | Enable 8-fold Dihedral $D_4$ ensemble averaging |
+| `--use-snake-heuristic` | `flag` | `True` | Enable topological snake monotonicity and corner lock shield |
+| `--use-afterstate-net` | `flag` | `False` | Query scalar $V(s_{\text{after}})$ head directly |
+| `--use-ntuple` | `flag` | `False` | Enable SOTA N-Tuple leaf value evaluation |
+| `--ntuple-path` | `str` | `None` | Path to pretrained N-Tuple `.npz` weights |
+| `--w-ntuple` | `float` | `0.15` | Weight multiplier for N-Tuple leaf value blending |
+| `--use-smoothness` | `flag` | `False` | Enable Manhattan smoothness and trapped wedge shield |
+| `--w-smooth` | `float` | `0.10` | Weight multiplier for Manhattan smoothness |
+| `--w-trap` | `float` | `5.00` | Weight multiplier for trapped tile penalty |
+| `--use-policy-pruning` | `flag` | `False` | Enable policy-guided action pruning at shallow plies |
+| `--policy-prune-tau` | `float` | `0.03` | Cutoff probability threshold for action pruning |
+| `--save-json` | `str` | `None` | Output filepath for machine-readable JSON summary |
 
 ---
 
-## 4. ONNX Model Export & Verification (`scripts/export_onnx.py`)
+## 4. Standalone N-Tuple TD($\lambda$) Training (`scripts/train_ntuple.py`)
+
+Train the N-Tuple lookup tables via afterstate Temporal Difference self-play directly on the CPU Bitboard engine:
+
+```bash
+# Train 50,000 self-play games with alpha decay
+python scripts/train_ntuple.py \
+  --episodes 50000 \
+  --alpha 0.05 \
+  --alpha-min 0.005 \
+  --gamma 0.99 \
+  --save-path checkpoints/ntuple/ntuple_best.npz \
+  --eval-every 5000
+```
+
+---
+
+## 5. ONNX Model Export & Verification (`scripts/export_onnx.py`)
 
 For high-performance inference, edge deployment, or integration into C++/Rust runtimes, `Dueling2048Net` can be exported directly to standard **ONNX** format:
 

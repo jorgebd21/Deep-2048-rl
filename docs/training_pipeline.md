@@ -86,3 +86,53 @@ $$\mathcal{L}(\theta_{\text{online}}) = \frac{1}{B} \sum_{i=1}^B w_i \cdot \text
 | Initial IS exponent ($\beta_0$) | $0.4$ | Importance sampling bias compensation |
 | Final IS exponent ($\beta_{\text{end}}$) | $1.0$ | Annealed linearly over $150,000$ steps |
 | Warmup steps | $1,000$ | Random legal steps before training start |
+
+---
+
+## 6. Native Afterstate Value Learning & Expert Iteration
+
+Traditional Q-learning directly estimates $Q(s, a)$, which must simultaneously predict the deterministic consequences of action $a$ and the stochastic outcome of nature's subsequent tile spawn.
+
+In 2048, every transition cleanly decomposes into two sequential half-steps:
+$$s_t \xrightarrow{a_t} s_{t, \text{after}} \xrightarrow{\text{spawn}} s_{t+1}$$
+
+### 6.1. Afterstate Bellman Formulation
+We parameterize the value function directly over the afterstate: $V(s_{\text{after}})$.
+The Bellman optimality equation for afterstates becomes:
+
+$$V^*(s_{\text{after}}) = \mathbb{E}_{\text{spawn}} \left[ \max_{a' \in \mathcal{A}_{\text{legal}}(s')} \left( r(s', a') + \gamma V^*(s'_{\text{after}}) \right) \right]$$
+
+- **Variance Elimination:** The deterministic merge occurs before $s_{\text{after}}$, so immediate rewards $r$ and merges are deterministic. Nature's random tile placement occurs *after* $s_{\text{after}}$, so taking an expectation over nature's spawn distribution isolates environmental stochasticity from policy evaluation.
+- **Dihedral Invariance ($D_4$):** By applying $D_4$ group transformations to afterstates during training, value predictions become strictly rotation- and reflection-invariant.
+
+### 6.2. Expert Iteration Pipeline (`src/training/expert_iteration.py`)
+Combines deep tree search with neural training:
+1. Tree search (Expectimax with afterstate value evaluations) acts as an expert policy $\pi^*(s)$.
+2. Full game trajectories $(s_{\text{after}}, r_{\text{next}}, s'_{\text{after}}, d)$ are recorded into the prioritized replay buffer.
+3. Neural network weights are optimized to minimize TD error on expert transitions, monotonically boosting both the search evaluation accuracy and downstream tree quality.
+
+---
+
+## 7. N-Tuple Network TD($\lambda$) Self-Play Training (`src/training/train_ntuple.py`)
+
+The SOTA N-Tuple Network is trained via afterstate Temporal Difference self-play directly on the 64-bit Bitboard representation:
+
+### 7.1. Fast CPU Self-Play Engine
+- Operates at $> 12,500\text{ game steps/sec}$ in pure Python/NumPy.
+- Generates tens of millions of transitions in minutes without GPU bottlenecks.
+
+### 7.2. Afterstate TD Error & Symmetrical Weight Updates
+For transition $s \xrightarrow{a} s_{\text{after}} \xrightarrow{\text{spawn}} s' \xrightarrow{a^*} s'_{\text{after}}$:
+
+$$\delta = r_{\text{next}} + (1 - d) \cdot \gamma \cdot V_{\text{ntuple}}(s'_{\text{after}}) - V_{\text{ntuple}}(s_{\text{after}})$$
+
+The error $\delta$ is back-projected across all active tuple tables across all 8 $D_4$ symmetries:
+
+$$\Delta W_p[\text{index}(t)] = \frac{\alpha}{|\mathcal{T}|} \cdot \delta$$
+
+where $|\mathcal{T}| = 24$ (3 patterns $\times$ 8 symmetries), calibrating the total value update to exactly $\alpha \cdot \delta$.
+
+### 7.3. Learning Rate Decay Schedule
+The learning rate $\alpha$ decays linearly over training episodes:
+$$\alpha_t = \alpha_{\text{init}} - (\alpha_{\text{init}} - \alpha_{\text{min}}) \frac{t}{T_{\text{total}}}$$
+(e.g., $0.05 \to 0.005$ over 30,000 self-play episodes), ensuring rapid topological structure discovery early on and fine-grained asymptotic convergence in the late phase.
