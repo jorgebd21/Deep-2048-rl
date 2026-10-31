@@ -1,6 +1,8 @@
 <div align="center">
 
-<img src="assets/hero_banner.png" alt="Deep-2048-RL Hero Banner" width="100%" style="border-radius: 12px; margin-bottom: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);" />
+<p align="center">
+  <img src="assets/hero_banner.png" alt="Deep-2048-RL Hero Banner" width="100%" />
+</p>
 
 # Deep-2048-RL: Autonomous Deep Reinforcement Learning for 2048
 
@@ -18,41 +20,43 @@
 </p>
 
 <p align="center">
-  <a href="#-quick-start-in-60-seconds">⚡ Quick Start</a> &bull;
-  <a href="#-key-capabilities">✨ Key Features</a> &bull;
-  <a href="#-architectural-overview">🧠 Architecture</a> &bull;
-  <a href="#-empirical-benchmarks">📊 Benchmarks</a> &bull;
-  <a href="#-cli-command-suite">🛠️ CLI Reference</a> &bull;
-  <a href="#-technical-documentation">📖 Documentation</a>
+  <a href="#quick-start">⚡ Quick Start</a> &bull;
+  <a href="#key-features">✨ Key Features</a> &bull;
+  <a href="#architecture">🧠 Architecture</a> &bull;
+  <a href="#benchmarks">📊 Benchmarks</a> &bull;
+  <a href="#cli-suite">🛠️ CLI Reference</a> &bull;
+  <a href="#documentation-index">📖 Documentation</a>
 </p>
 
 </div>
 
 ---
 
+<a id="table-of-contents"></a>
 ## 🧭 Interactive Table of Contents
 
-- [⚡ Quick Start in 60 Seconds](#-quick-start-in-60-seconds)
-- [✨ Key Capabilities & Scientific Pillars](#-key-capabilities--scientific-pillars)
-- [🧠 Architectural Overview](#-architectural-overview)
+- [⚡ Quick Start in 60 Seconds](#quick-start)
+- [✨ Key Capabilities & Scientific Pillars](#key-features)
+- [🧠 Architectural Overview](#architecture)
   - [High-Level Flow Diagram](#high-level-flow-diagram)
   - [The Trifecta Decision Engine](#the-trifecta-decision-engine)
-- [📊 Empirical Benchmarks & Milestone Performance](#-empirical-benchmarks--milestone-performance)
-  - [Monte Carlo Milestone Evaluation ($N=30$)](#monte-carlo-milestone-evaluation-n30)
-  - [Hardware Throughput & Latency Scaling](#hardware-throughput--latency-scaling)
-- [🛠️ CLI Command Suite & Operational Workflows](#️-cli-command-suite--operational-workflows)
+- [📊 Empirical Benchmarks & Milestone Performance](#benchmarks)
+  - [Monte Carlo Milestone Evaluation ($N=30$)](#monte-carlo-benchmarks)
+  - [Hardware Throughput & Latency Scaling](#hardware-benchmarks)
+- [🛠️ CLI Command Suite & Operational Workflows](#cli-suite)
   - [1. Deterministic Monte Carlo Evaluation](#1-deterministic-monte-carlo-evaluation)
   - [2. Interactive ANSI Live Visualizer](#2-interactive-ansi-live-visualizer)
   - [3. Deep Q-Network & Afterstate Training](#3-deep-q-network--afterstate-training)
   - [4. Pure CPU N-Tuple Self-Play Pipeline](#4-pure-cpu-n-tuple-self-play-pipeline)
   - [5. Production ONNX Deployment](#5-production-onnx-deployment)
-- [⚙️ Configuration Parameter Matrix](#️-configuration-parameter-matrix)
-- [📁 Repository Blueprint](#-repository-blueprint)
-- [📖 Technical Documentation Index](#-technical-documentation-index)
-- [📜 License & Citation](#-license--citation)
+- [⚙️ Configuration Parameter Matrix](#configuration)
+- [📁 Repository Blueprint](#repository-structure)
+- [📖 Technical Documentation Index](#documentation-index)
+- [📜 License & Citation](#license)
 
 ---
 
+<a id="quick-start"></a>
 ## ⚡ Quick Start in 60 Seconds
 
 Experience the autonomous agent playing live in your terminal with zero setup overhead:
@@ -120,6 +124,7 @@ pytest tests/ -v
 
 ---
 
+<a id="key-features"></a>
 ## ✨ Key Capabilities & Scientific Pillars
 
 <table>
@@ -157,17 +162,18 @@ pytest tests/ -v
 
 ---
 
+<a id="architecture"></a>
 ## 🧠 Architectural Overview
 
 ### High-Level Flow Diagram
 
 ```mermaid
 flowchart TD
-    %% Styling
-    classDef sim fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
-    classDef mem fill:#0f172a,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
-    classDef dl fill:#0f172a,stroke:#34d399,stroke-width:2px,color:#f8fafc;
-    classDef search fill:#0f172a,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+    %% Base Node Color Styles
+    classDef simNode fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+    classDef memNode fill:#0f172a,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+    classDef dlNode fill:#0f172a,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+    classDef searchNode fill:#0f172a,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
 
     subgraph Simulation["1. High-Throughput Simulation Layer (CPU)"]
         BoardState["Game Grid (4x4 Matrix)"]
@@ -176,29 +182,36 @@ flowchart TD
         BoardState --> Bitboard
         Bitboard --> Mask
     end
-    class Simulation,BoardState,Bitboard,Mask sim;
 
     subgraph Memory["2. Prioritized Memory Storage (RAM)"]
-        Bitboard -->|Packed uint8 Exponents| Buffer["Prioritized Replay Buffer<br/>SumTree Binary Heap O(log N)<br/>(< 180 MB for 100k transitions)"]
+        Buffer["Prioritized Replay Buffer<br/>SumTree Binary Heap O(log N)<br/>(< 180 MB for 100k transitions)"]
+        Bitboard -->|Packed uint8 Exponents| Buffer
     end
-    class Memory,Buffer mem;
 
     subgraph DeepLearning["3. Neural & Lookup Representations (GPU & CPU)"]
-        Buffer -->|Pinned Memory DMA| NetInput["Observation Tensor<br/>(B x 16 x 4 x 4 One-Hot)"]
-        NetInput --> AsymmConv["Asymmetric Multi-Scale Convolutions<br/>(1x2, 2x1, 2x2, 1x1 Kernels)"]
-        AsymmConv --> DuelingNet["Dueling DDQN / Afterstate Net<br/>Value V(s) & Advantage A(s, a)"]
-        Bitboard -->|Base-16 Symmetry Extractor| NTuple["SOTA N-Tuple Network<br/>8-fold D4 Weight Sharing<br/>(< 1.0 µs / board)"]
+        NetInput["Observation Tensor<br/>(B x 16 x 4 x 4 One-Hot)"]
+        AsymmConv["Asymmetric Multi-Scale Convolutions<br/>(1x2, 2x1, 2x2, 1x1 Kernels)"]
+        DuelingNet["Dueling DDQN / Afterstate Net<br/>Value V(s) & Advantage A(s, a)"]
+        NTuple["SOTA N-Tuple Network<br/>8-fold D4 Weight Sharing<br/>(< 1.0 µs / board)"]
+        Buffer -->|Pinned Memory DMA| NetInput
+        NetInput --> AsymmConv
+        AsymmConv --> DuelingNet
+        Bitboard -->|Base-16 Symmetry Extractor| NTuple
     end
-    class DeepLearning,NetInput,AsymmConv,DuelingNet,NTuple dl;
 
     subgraph DecisionSearch["4. Hybrid Decision & Tree Search Layer"]
-        DuelingNet --> SearchEngine["Expectimax Search Engine<br/>Adaptive 2..6 ply Lookahead<br/>D4 Transposition Tables"]
+        SearchEngine["Expectimax Search Engine<br/>Adaptive 2..6 ply Lookahead<br/>D4 Transposition Tables"]
+        DuelingNet --> SearchEngine
         NTuple -->|Leaf Valuation| SearchEngine
         Mask -->|Legal Action Pruning| SearchEngine
         Bitboard -->|Smoothness & Wedge Shields| SearchEngine
         SearchEngine -->|Optimal Action a*| BoardState
     end
-    class DecisionSearch,SearchEngine search;
+
+    class BoardState,Bitboard,Mask simNode;
+    class Buffer memNode;
+    class NetInput,AsymmConv,DuelingNet,NTuple dlNode;
+    class SearchEngine searchNode;
 ```
 
 ### The Trifecta Decision Engine
@@ -211,8 +224,10 @@ The agent unifies three complementary paradigms to overcome the stochasticity an
 
 ---
 
+<a id="benchmarks"></a>
 ## 📊 Empirical Benchmarks & Milestone Performance
 
+<a id="monte-carlo-benchmarks"></a>
 ### Monte Carlo Milestone Evaluation ($N=30$ Full Games)
 
 Evaluated under strict tournament conditions on `checkpoints/afterstate/checkpoint_best.pt` with canonical $D_4$ Transposition Tables:
@@ -227,6 +242,7 @@ Evaluated under strict tournament conditions on `checkpoints/afterstate/checkpoi
 | **Peak High Score** | 36,448 | 78,808 | 77,128 | <strong style="color:#00FFA3;">78,960 points</strong> |
 | **Search Speed** | 1,240 moves/s | 113.8 moves/s | 88.5 moves/s | **92.4 moves/sec** |
 
+<a id="hardware-benchmarks"></a>
 ### Hardware Throughput & Latency Scaling
 
 Micro-benchmarks measured on standard test harness (CPython 3.11.9, PyTorch 2.6.0+cu124, NVIDIA RTX 3060 12GB):
@@ -246,6 +262,7 @@ Micro-benchmarks measured on standard test harness (CPython 3.11.9, PyTorch 2.6.
 
 ---
 
+<a id="cli-suite"></a>
 ## 🛠️ CLI Command Suite & Operational Workflows
 
 ### 1. Deterministic Monte Carlo Evaluation
@@ -311,6 +328,7 @@ python scripts/export_onnx.py \
 
 ---
 
+<a id="configuration"></a>
 ## ⚙️ Configuration Parameter Matrix
 
 <details>
@@ -360,6 +378,7 @@ python scripts/export_onnx.py \
 
 ---
 
+<a id="repository-structure"></a>
 ## 📁 Repository Blueprint
 
 ```text
@@ -402,6 +421,7 @@ Deep-2048-rl/
 
 ---
 
+<a id="documentation-index"></a>
 ## 📖 Technical Documentation Index
 
 For in-depth mathematical proofs, hardware profiling, and architectural specifications, consult our specialized technical guides:
@@ -418,6 +438,7 @@ For in-depth mathematical proofs, hardware profiling, and architectural specific
 
 ---
 
+<a id="license"></a>
 ## 📜 License & Citation
 
 This project is licensed under the terms of the **[MIT License](LICENSE)**.
